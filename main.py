@@ -2,7 +2,7 @@
 PKU AI Teaching Assistant CLI
 
 Commands:
-  ta grade   --course <id> --column <id> --rubric <file> [--whitelist a,b,c] [--out scores.xlsx]
+  ta grade   --course <id> --column <id> --rubric <file> [--whitelist a,b,c] [--out scores.xlsx] [--verbose] [--resume] [--lang en|zh]
   ta review  [--scores scores.xlsx] [--submissions submissions/] [--needs-review] [--all]
   ta submit  --course <id> --column <id> --scores <reviewed.xlsx> [--dry-run]
 """
@@ -11,10 +11,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Annotated, Optional
+from time import time
 
 import typer
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TextColumn
 
 app = typer.Typer(help="PKU AI Teaching Assistant")
 console = Console()
@@ -28,13 +29,53 @@ def grade(
     whitelist: Annotated[str, typer.Option(help="Comma-separated student IDs to include; empty = all")] = "",
     out: Annotated[Path, typer.Option(help="Output Excel path")] = Path("scores.xlsx"),
     save_dir: Annotated[Optional[Path], typer.Option(help="Save submission files here for human review; default: submissions/")] = Path("submissions"),
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores for each student")] = False,
+    resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume from previous partial run (if any)")] = False,
+    lang: Annotated[str, typer.Option(help="LLM prompt language: en or zh")] = "en",
 ) -> None:
-    """Crawl submissions, score with LLM, export review spreadsheet."""
+    """Crawl submissions, score with LLM, export review spreadsheet.
+
+    Press Ctrl-C to interrupt; partial results will be saved to the output file
+    and can be resumed with --resume.
+    """
+    from threading import Lock
+
     from auth.iaaa import get_session
     from config import settings
     from crawler.pku_homework import PKUHomeworkCrawler
     from review.spreadsheet import export
     from scorer.llm import score_submission
+    from models import ScoringResult
+
+    # Checkpoint save/load using Excel format
+    checkpoint_path = out
+    all_results: list[ScoringResult] = []
+    processed_ids: set[str] = set()
+    save_lock = Lock()
+
+    def save_checkpoint() -> None:
+        """Save current progress to output Excel file."""
+        with save_lock:
+            if all_results:
+                export(all_results, checkpoint_path)
+
+    def load_checkpoint() -> list[ScoringResult]:
+        """Load previous progress from output Excel file (if exists and --resume is set)."""
+        if resume and checkpoint_path.exists():
+            try:
+                from review.spreadsheet import load_reviewed
+                records = load_reviewed(checkpoint_path)
+                results = [r.result for r in records]
+                console.print(f"[bold cyan]Resuming from checkpoint:[/bold cyan] {len(results)} previously processed result(s)")
+                return results
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not load checkpoint: {e}[/yellow]")
+        return []
+
+    # Load checkpoint if resuming
+    if resume:
+        all_results = load_checkpoint()
+        processed_ids = {r.student_id for r in all_results}
 
     # Resolve config — CLI args override .env
     course_id = course or settings.course_id
@@ -67,37 +108,101 @@ def grade(
         columns = crawler.fetch_assignments()
         console.print(f"  Found {len(columns)} assignment(s).")
 
-    all_results = []
-    for col in columns:
-        grade_book_pk = col.get("gradeBookPK") or col["id"].strip("_").split("_")[0]
-        col_title = col.get("name") or col["id"]
-        console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
+    interrupted = False
+    start_time = time()
 
-        submissions = crawler.fetch_submissions(grade_book_pk, col_title)
-        if not submissions:
-            console.print("  No submissions found.")
-            continue
+    try:
+        for col in columns:
+            grade_book_pk = col.get("gradeBookPK") or col["id"].strip("_").split("_")[0]
+            col_title = col.get("name") or col["id"]
+            console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
-        if save_dir:
-            _save_submissions(submissions, save_dir, col_title)
-            console.print(f"  Saved files → [cyan]{save_dir / col_title}[/cyan]")
+            submissions = crawler.fetch_submissions(grade_book_pk, col_title)
+            if not submissions:
+                console.print("  No submissions found.")
+                continue
 
-        console.print(f"  Scoring {len(submissions)} submission(s) with LLM (threads={settings.ta_threads})…")
-        with Progress(
-            SpinnerColumn(), BarColumn(), TaskProgressColumn(), TimeElapsedColumn(),
-            console=console, transient=True,
-        ) as progress:
-            task = progress.add_task("  Scoring", total=len(submissions))
-            with ThreadPoolExecutor(max_workers=settings.ta_threads) as executor:
-                futures = {executor.submit(score_submission, sub, rubric_text): sub for sub in submissions}
-                for future in as_completed(futures):
-                    sub = futures[future]
-                    try:
-                        all_results.append(future.result())
-                    except Exception as e:
-                        console.print(f"  [red]Error scoring {sub.student_id}:[/red] {e}")
-                    finally:
-                        progress.advance(task)
+            # Filter out already processed submissions if resuming
+            if processed_ids:
+                submissions = [s for s in submissions if s.student_id not in processed_ids]
+                if not submissions:
+                    console.print("  All submissions already processed.")
+                    continue
+                console.print(f"  {len(submissions)} submission(s) remaining to process")
+
+            if save_dir:
+                _save_submissions(submissions, save_dir, col_title)
+                console.print(f"  Saved files → [cyan]{save_dir / col_title}[/cyan]")
+
+            total_submissions = len(submissions)
+            console.print(f"  Scoring {total_submissions} submission(s) with LLM (threads={settings.ta_threads}, lang={lang})…")
+            console.print(f"  [dim]Press Ctrl-C to interrupt — progress will be saved[/dim]")
+
+            # Use transient=False for verbose mode so results stay on screen
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TextColumn("[dim]ETA: {task.fields[eta]}"),
+                console=console, transient=not verbose,
+            ) as progress:
+                task = progress.add_task("  Scoring", total=total_submissions, eta="calculating...")
+                completed_count = 0
+
+                with ThreadPoolExecutor(max_workers=settings.ta_threads) as executor:
+                    futures = {executor.submit(score_submission, sub, rubric_text, lang): sub for sub in submissions}
+                    for future in as_completed(futures):
+                        sub = futures[future]
+                        try:
+                            result = future.result()
+                            all_results.append(result)
+                            processed_ids.add(result.student_id)
+                            completed_count += 1
+
+                            # Calculate ETA
+                            if completed_count >= 2:
+                                elapsed = time() - start_time
+                                avg_time_per = elapsed / completed_count
+                                remaining = (total_submissions - completed_count) * avg_time_per
+                                if remaining < 60:
+                                    eta_str = f"{remaining:.0f}s"
+                                elif remaining < 3600:
+                                    eta_str = f"{remaining/60:.1f}m"
+                                else:
+                                    eta_str = f"{remaining/3600:.1f}h"
+                                progress.update(task, eta=eta_str)
+                            else:
+                                progress.update(task, eta="...")
+
+                            # Save checkpoint after each result for safety
+                            save_checkpoint()
+
+                            if verbose:
+                                # Show verbose output for each student
+                                needs_review = result.needs_review
+                                color = "yellow" if needs_review else "green"
+                                status = "NEEDS_REVIEW" if needs_review else "OK"
+                                console.print(
+                                    f"  [{color}]{result.student_id:12s}[/] {result.student_name:10s} "
+                                    f"→ {result.total_score:3.0f}/{result.total_max:3.0f} ({result.pct:3.0f}%) "
+                                    f"[{color}]{status}[/]"
+                                )
+                        except Exception as e:
+                            console.print(f"  [red]Error scoring {sub.student_id}:[/red] {e}")
+                        finally:
+                            progress.advance(task)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        interrupted = True
+        if all_results:
+            console.print(f"[yellow]Saving {len(all_results)} partial result(s)...[/yellow]")
+            save_checkpoint()
+            console.print(f"[cyan]Checkpoint saved to {checkpoint_path}[/cyan]")
+            console.print(f"[cyan]Resume later with: --resume[/cyan]")
+        raise typer.Exit(1)
 
     if not all_results:
         console.print("[yellow]No results to export.[/yellow]")
@@ -162,6 +267,7 @@ def review(
     """Interactive TUI for reviewing submissions one by one.
 
     Shows score breakdown, opens submission file, and lets you approve or override scores.
+    Press 'e' to edit individual criterion scores.
     """
     import json
     import os
@@ -170,7 +276,7 @@ def review(
 
     import openpyxl
     from rich.panel import Panel
-    from rich.prompt import Confirm, Prompt
+    from rich.prompt import Confirm, Prompt, IntPrompt
     from rich.table import Table
     from rich.text import Text
 
@@ -206,8 +312,8 @@ def review(
             console.print(f"[yellow]Warning: Could not open file ({e})[/yellow]")
             console.print(f"[dim]Please open manually: {filepath_str}[/dim]")
 
-    def display_student(row_data: dict, row_idx: int, total: int) -> None:
-        """Display student info and score breakdown using Rich."""
+    def display_student(row_data: dict, row_idx: int, total: int, breakdown: list | None = None) -> list:
+        """Display student info and score breakdown using Rich. Returns the breakdown list."""
         console.print()
         console.print(Panel.fit(
             f"[bold cyan]Student {row_idx}/{total}[/bold cyan]",
@@ -222,27 +328,34 @@ def review(
         info_table.add_row("[bold]Needs review:[/]", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
         info_table.add_row("[bold]Current approved:[/]", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
         console.print(Panel(info_table, title="Student Info", border_style="cyan"))
-        try:
-            breakdown = json.loads(row_data.get("breakdown_json", "[]"))
-            if breakdown:
-                bd_table = Table(title="Score Breakdown")
-                bd_table.add_column("Criterion", style="cyan")
-                bd_table.add_column("Awarded", justify="right", style="green")
-                bd_table.add_column("Max", justify="right")
-                bd_table.add_column("Reasoning", style="dim")
-                for item in breakdown:
-                    awarded = float(item.get("points_awarded", 0))
-                    max_p = float(item.get("points_max", 0))
-                    style = "red" if awarded < max_p else "green"
-                    bd_table.add_row(
-                        str(item.get("criterion", "")),
-                        Text(f"{awarded}", style=style),
-                        f"{max_p}",
-                        str(item.get("reasoning", ""))
-                    )
-                console.print(Panel(bd_table, border_style="green"))
-        except json.JSONDecodeError:
-            console.print("[yellow]Warning: Could not parse breakdown_json[/yellow]")
+
+        if breakdown is None:
+            try:
+                breakdown = json.loads(row_data.get("breakdown_json", "[]"))
+            except json.JSONDecodeError:
+                breakdown = []
+                console.print("[yellow]Warning: Could not parse breakdown_json[/yellow]")
+
+        if breakdown:
+            bd_table = Table(title="Score Breakdown")
+            bd_table.add_column("#", style="dim", justify="right")
+            bd_table.add_column("Criterion", style="cyan")
+            bd_table.add_column("Awarded", justify="right", style="green")
+            bd_table.add_column("Max", justify="right")
+            bd_table.add_column("Reasoning", style="dim")
+            for i, item in enumerate(breakdown, start=1):
+                awarded = float(item.get("points_awarded", 0))
+                max_p = float(item.get("points_max", 0))
+                style = "red" if awarded < max_p else "green"
+                bd_table.add_row(
+                    str(i),
+                    str(item.get("criterion", "")),
+                    Text(f"{awarded}", style=style),
+                    f"{max_p}",
+                    str(item.get("reasoning", ""))
+                )
+            console.print(Panel(bd_table, border_style="green"))
+
         try:
             uncertain = json.loads(row_data.get("uncertain_parts_json", "[]"))
             if uncertain:
@@ -257,12 +370,76 @@ def review(
                 console.print(Panel(uc_table, border_style="yellow"))
         except json.JSONDecodeError:
             pass
+
         if row_data.get("llm_reasoning"):
             console.print(Panel(
                 Text(str(row_data["llm_reasoning"]), style="dim"),
                 title="LLM Reasoning",
                 border_style="dim"
             ))
+
+        return breakdown
+
+    def edit_breakdown(breakdown: list) -> tuple[list, float, float]:
+        """Interactive editor for breakdown. Returns (new_breakdown, new_total, new_max)."""
+        while True:
+            console.print()
+            console.print(Panel("[bold]Edit Criterion Scores[/bold]\n"
+                               "Enter the number of the criterion to edit, or 'd' when done",
+                               border_style="magenta"))
+
+            # Show current breakdown with numbers
+            bd_table = Table()
+            bd_table.add_column("#", style="dim", justify="right")
+            bd_table.add_column("Criterion", style="cyan")
+            bd_table.add_column("Awarded", justify="right", style="green")
+            bd_table.add_column("Max", justify="right")
+            for i, item in enumerate(breakdown, start=1):
+                awarded = float(item.get("points_awarded", 0))
+                max_p = float(item.get("points_max", 0))
+                style = "red" if awarded < max_p else "green"
+                bd_table.add_row(
+                    str(i),
+                    str(item.get("criterion", "")),
+                    Text(f"{awarded}", style=style),
+                    f"{max_p}"
+                )
+            console.print(bd_table)
+
+            # Calculate and show current total
+            current_total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
+            current_max = sum(float(b.get("points_max", 0)) for b in breakdown)
+            console.print(f"\n[bold]Current Total:[/bold] {current_total} / {current_max}")
+            console.print()
+
+            choice = Prompt.ask("[bold magenta]Criterion # to edit, or [d]one[/bold magenta]",
+                               choices=[str(i) for i in range(1, len(breakdown) + 1)] + ["d", "done"],
+                               default="d")
+
+            if choice.lower() in ("d", "done"):
+                new_total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
+                new_max = sum(float(b.get("points_max", 0)) for b in breakdown)
+                return breakdown, new_total, new_max
+
+            # Edit selected criterion
+            idx = int(choice) - 1
+            item = breakdown[idx]
+            console.print(f"\n[bold]Editing:[/bold] {item.get('criterion', '')}")
+            console.print(f"  Current: {item.get('points_awarded', 0)} / {item.get('points_max', 0)}")
+            console.print(f"  Reasoning: {item.get('reasoning', '')}")
+
+            new_score = Prompt.ask(f"  New score (0-{item.get('points_max', 0)})",
+                                  default=str(item.get("points_awarded", 0)))
+            try:
+                score_val = float(new_score)
+                max_val = float(item.get("points_max", 0))
+                if 0 <= score_val <= max_val:
+                    item["points_awarded"] = score_val
+                    console.print(f"[green]Updated to {score_val} / {max_val}[/green]")
+                else:
+                    console.print(f"[red]Score must be between 0 and {max_val}[/red]")
+            except ValueError:
+                console.print("[red]Invalid number[/red]")
 
     if not scores.exists():
         console.print(f"[red]Error:[/red] Scores file not found: {scores}")
@@ -294,43 +471,85 @@ def review(
     modified = False
 
     for i, (row_idx, row_data) in enumerate(rows, start=1):
-        display_student(row_data, i, len(rows))
-        student_id = str(row_data["student_id"])
-        student_name = str(row_data["student_name"])
-        sub_file = find_submission_file(submissions, student_id, student_name)
+        # Load breakdown first
+        try:
+            breakdown = json.loads(row_data.get("breakdown_json", "[]"))
+        except json.JSONDecodeError:
+            breakdown = []
 
-        if sub_file:
-            console.print(f"[bold blue]Opening submission:[/bold blue] {sub_file}")
-            open_file(sub_file)
-        else:
-            console.print("[yellow]Warning: No submission file found[/yellow]")
-        console.print()
+        while True:
+            display_student(row_data, i, len(rows), breakdown)
+            student_id = str(row_data["student_id"])
+            student_name = str(row_data["student_name"])
+            sub_file = find_submission_file(submissions, student_id, student_name)
 
-        action = Prompt.ask(
-            "[bold cyan]Action[/bold cyan]",
-            choices=["a", "approve", "s", "skip", "o", "override", "q", "quit"],
-            default="skip"
-        )
+            if sub_file:
+                console.print(f"[bold blue]Submission:[/bold blue] {sub_file}")
+            else:
+                console.print("[yellow]Warning: No submission file found[/yellow]")
+            console.print()
+
+            action = Prompt.ask(
+                "[bold cyan]Action[/bold cyan]",
+                choices=["a", "approve", "s", "skip", "e", "edit", "o", "open", "ov", "override", "q", "quit"],
+                default="skip"
+            )
+
+            if action in ("q", "quit"):
+                console.print("[yellow]Quitting...[/yellow]")
+                break
+
+            if action in ("a", "approve"):
+                ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
+                row_data["approved"] = "YES"
+                modified = True
+                console.print("[green]Marked as approved.[/green]")
+                break
+
+            elif action in ("e", "edit"):
+                if not breakdown:
+                    console.print("[yellow]No breakdown data to edit[/yellow]")
+                    continue
+                breakdown, new_total, new_max = edit_breakdown(breakdown)
+                # Update the row data
+                row_data["breakdown_json"] = json.dumps(breakdown)
+                row_data["total_score"] = new_total
+                row_data["total_max"] = new_max
+                row_data["pct"] = round((new_total / new_max) * 100, 1) if new_max > 0 else 0
+                # Update Excel
+                ws.cell(row=row_idx, column=idx["breakdown_json"] + 1, value=row_data["breakdown_json"])
+                ws.cell(row=row_idx, column=idx["total_score"] + 1, value=new_total)
+                ws.cell(row=row_idx, column=idx["total_max"] + 1, value=new_max)
+                ws.cell(row=row_idx, column=idx["pct"] + 1, value=row_data["pct"])
+                modified = True
+                console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
+                continue
+
+            elif action in ("o", "open") and sub_file:
+                open_file(sub_file)
+                continue
+
+            elif action in ("ov", "override"):
+                new_score = Prompt.ask("[bold cyan]Enter override score[/bold cyan]")
+                if new_score:
+                    try:
+                        score_val = float(new_score)
+                        ws.cell(row=row_idx, column=idx["reviewer_override_score"] + 1, value=score_val)
+                        ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
+                        row_data["approved"] = "YES"
+                        modified = True
+                        console.print(f"[green]Set override score: {score_val} and marked as approved.[/green]")
+                        break
+                    except ValueError:
+                        console.print("[red]Invalid score[/red]")
+                continue
+
+            else:
+                console.print("[dim]Skipped.[/dim]")
+                break
+
         if action in ("q", "quit"):
-            console.print("[yellow]Quitting...[/yellow]")
             break
-        if action in ("a", "approve"):
-            ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
-            modified = True
-            console.print("[green]Marked as approved.[/green]")
-        elif action in ("o", "override"):
-            new_score = Prompt.ask("[bold cyan]Enter override score[/bold cyan]")
-            if new_score:
-                try:
-                    score_val = float(new_score)
-                    ws.cell(row=row_idx, column=idx["reviewer_override_score"] + 1, value=score_val)
-                    ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
-                    modified = True
-                    console.print(f"[green]Set override score: {score_val} and marked as approved.[/green]")
-                except ValueError:
-                    console.print("[red]Invalid score, skipping.[/red]")
-        else:
-            console.print("[dim]Skipped.[/dim]")
 
     if modified:
         console.print()
