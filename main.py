@@ -3,6 +3,7 @@ PKU AI Teaching Assistant CLI
 
 Commands:
   ta grade   --course <id> --column <id> --rubric <file> [--whitelist a,b,c] [--out scores.xlsx]
+  ta review  [--scores scores.xlsx] [--submissions submissions/] [--needs-review] [--all]
   ta submit  --course <id> --column <id> --scores <reviewed.xlsx> [--dry-run]
 """
 from __future__ import annotations
@@ -149,6 +150,197 @@ def submit(
     client = get_session()
 
     submit_scores(client, course_id, col_id, records, dry_run=dry_run)
+
+
+@app.command()
+def review(
+    scores: Annotated[Path, typer.Option(help="Excel spreadsheet to review")] = Path("scores.xlsx"),
+    submissions: Annotated[Path, typer.Option(help="Directory with submission files")] = Path("submissions"),
+    needs_review_only: Annotated[bool, typer.Option("--needs-review", "-n", help="Only review students marked needs_review=YES")] = False,
+    all_students: Annotated[bool, typer.Option("--all", "-a", help="Review all students (including already approved)")] = False,
+) -> None:
+    """Interactive TUI for reviewing submissions one by one.
+
+    Shows score breakdown, opens submission file, and lets you approve or override scores.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    import openpyxl
+    from rich.panel import Panel
+    from rich.prompt import Confirm, Prompt
+    from rich.table import Table
+    from rich.text import Text
+
+    def find_submission_file(submissions_dir: Path, student_id: str, student_name: str) -> Path | None:
+        """Find submission file for a student by matching student_id in filename."""
+        if not submissions_dir.exists():
+            return None
+        for assignment_dir in submissions_dir.iterdir():
+            if not assignment_dir.is_dir() or assignment_dir.name.startswith("."):
+                continue
+            for f in assignment_dir.iterdir():
+                if f.is_file() and not f.name.startswith(".") and student_id in f.name:
+                    return f
+        return None
+
+    def open_file(filepath: Path) -> None:
+        """Open file with default system viewer. Cross-platform support."""
+        filepath_str = str(filepath)
+        try:
+            if sys.platform == "darwin":  # macOS
+                subprocess.run(["open", filepath_str], check=False)
+            elif sys.platform == "win32":  # Windows
+                os.startfile(filepath_str)  # type: ignore
+            else:  # Linux / Unix variants
+                for opener in ["xdg-open", "gio", "gnome-open", "kde-open"]:
+                    try:
+                        subprocess.run([opener, filepath_str], check=False,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        break
+                    except (subprocess.SubprocessError, FileNotFoundError):
+                        continue
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not open file ({e})[/yellow]")
+            console.print(f"[dim]Please open manually: {filepath_str}[/dim]")
+
+    def display_student(row_data: dict, row_idx: int, total: int) -> None:
+        """Display student info and score breakdown using Rich."""
+        console.print()
+        console.print(Panel.fit(
+            f"[bold cyan]Student {row_idx}/{total}[/bold cyan]",
+            title="Review Progress",
+            border_style="blue"
+        ))
+        info_table = Table(show_header=False, box=None)
+        info_table.add_row("[bold]Student ID:[/]", str(row_data["student_id"]))
+        info_table.add_row("[bold]Name:[/]", str(row_data["student_name"]))
+        info_table.add_row("[bold]Score:[/]", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+        info_table.add_row("[bold]Confidence:[/]", f"{row_data['confidence']}")
+        info_table.add_row("[bold]Needs review:[/]", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
+        info_table.add_row("[bold]Current approved:[/]", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
+        console.print(Panel(info_table, title="Student Info", border_style="cyan"))
+        try:
+            breakdown = json.loads(row_data.get("breakdown_json", "[]"))
+            if breakdown:
+                bd_table = Table(title="Score Breakdown")
+                bd_table.add_column("Criterion", style="cyan")
+                bd_table.add_column("Awarded", justify="right", style="green")
+                bd_table.add_column("Max", justify="right")
+                bd_table.add_column("Reasoning", style="dim")
+                for item in breakdown:
+                    awarded = float(item.get("points_awarded", 0))
+                    max_p = float(item.get("points_max", 0))
+                    style = "red" if awarded < max_p else "green"
+                    bd_table.add_row(
+                        str(item.get("criterion", "")),
+                        Text(f"{awarded}", style=style),
+                        f"{max_p}",
+                        str(item.get("reasoning", ""))
+                    )
+                console.print(Panel(bd_table, border_style="green"))
+        except json.JSONDecodeError:
+            console.print("[yellow]Warning: Could not parse breakdown_json[/yellow]")
+        try:
+            uncertain = json.loads(row_data.get("uncertain_parts_json", "[]"))
+            if uncertain:
+                uc_table = Table(title="Uncertain Parts")
+                uc_table.add_column("Description", style="yellow")
+                uc_table.add_column("Suggested Score", justify="right")
+                for item in uncertain:
+                    uc_table.add_row(
+                        str(item.get("description", "")),
+                        f"{item.get('suggested_score', 0)} / {item.get('suggested_max', 0)}"
+                    )
+                console.print(Panel(uc_table, border_style="yellow"))
+        except json.JSONDecodeError:
+            pass
+        if row_data.get("llm_reasoning"):
+            console.print(Panel(
+                Text(str(row_data["llm_reasoning"]), style="dim"),
+                title="LLM Reasoning",
+                border_style="dim"
+            ))
+
+    if not scores.exists():
+        console.print(f"[red]Error:[/red] Scores file not found: {scores}")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]Loading spreadsheet:[/bold] {scores}")
+    wb = openpyxl.load_workbook(scores)
+    ws = wb.active
+
+    headers = [cell.value for cell in ws[1]]
+    idx = {name: i for i, name in enumerate(headers)}
+
+    rows: list[tuple[int, dict]] = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row[idx["student_id"]]:
+            continue
+        row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
+        if needs_review_only and row_data.get("needs_review") != "YES":
+            continue
+        if not all_students and str(row_data.get("approved", "")).upper() == "YES":
+            continue
+        rows.append((row_idx, row_data))
+
+    if not rows:
+        console.print("[yellow]No students to review with the current filters.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"[green]Found {len(rows)} student(s) to review.[/green]")
+    modified = False
+
+    for i, (row_idx, row_data) in enumerate(rows, start=1):
+        display_student(row_data, i, len(rows))
+        student_id = str(row_data["student_id"])
+        student_name = str(row_data["student_name"])
+        sub_file = find_submission_file(submissions, student_id, student_name)
+
+        if sub_file:
+            console.print(f"[bold blue]Opening submission:[/bold blue] {sub_file}")
+            open_file(sub_file)
+        else:
+            console.print("[yellow]Warning: No submission file found[/yellow]")
+        console.print()
+
+        action = Prompt.ask(
+            "[bold cyan]Action[/bold cyan]",
+            choices=["a", "approve", "s", "skip", "o", "override", "q", "quit"],
+            default="skip"
+        )
+        if action in ("q", "quit"):
+            console.print("[yellow]Quitting...[/yellow]")
+            break
+        if action in ("a", "approve"):
+            ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
+            modified = True
+            console.print("[green]Marked as approved.[/green]")
+        elif action in ("o", "override"):
+            new_score = Prompt.ask("[bold cyan]Enter override score[/bold cyan]")
+            if new_score:
+                try:
+                    score_val = float(new_score)
+                    ws.cell(row=row_idx, column=idx["reviewer_override_score"] + 1, value=score_val)
+                    ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
+                    modified = True
+                    console.print(f"[green]Set override score: {score_val} and marked as approved.[/green]")
+                except ValueError:
+                    console.print("[red]Invalid score, skipping.[/red]")
+        else:
+            console.print("[dim]Skipped.[/dim]")
+
+    if modified:
+        console.print()
+        if Confirm.ask("[bold cyan]Save changes to spreadsheet?[/bold cyan]", default=True):
+            wb.save(scores)
+            console.print(f"[green]Saved to {scores}[/green]")
+        else:
+            console.print("[yellow]Changes not saved.[/yellow]")
+    else:
+        console.print("[dim]No changes made.[/dim]")
 
 
 def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> None:
