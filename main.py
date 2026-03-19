@@ -313,6 +313,7 @@ def review(
 
     def open_file(filepath: Path) -> None:
         """Open file with default system viewer. Cross-platform support."""
+        import shutil
         filepath_str = str(filepath)
         try:
             if sys.platform == "darwin":  # macOS
@@ -320,13 +321,15 @@ def review(
             elif sys.platform == "win32":  # Windows
                 os.startfile(filepath_str)  # type: ignore
             else:  # Linux / Unix variants
+                # Try openers in order of preference, checking if they exist first
                 for opener in ["xdg-open", "gio", "gnome-open", "kde-open"]:
-                    try:
-                        subprocess.run([opener, filepath_str], check=False,
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        break
-                    except (subprocess.SubprocessError, FileNotFoundError):
-                        continue
+                    if shutil.which(opener):
+                        try:
+                            subprocess.run([opener, filepath_str], check=False,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            break
+                        except Exception:
+                            continue
         except Exception as e:
             console.print(f"[yellow]Warning: Could not open file ({e})[/yellow]")
             console.print(f"[dim]Please open manually: {filepath_str}[/dim]")
