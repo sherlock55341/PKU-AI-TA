@@ -261,13 +261,14 @@ def submit(
 def review(
     scores: Annotated[Path, typer.Option(help="Excel spreadsheet to review")] = Path("scores.xlsx"),
     submissions: Annotated[Path, typer.Option(help="Directory with submission files")] = Path("submissions"),
+    rubric: Annotated[Path, typer.Option(help="Path to rubric file to open during review")] = Path("rubric.md"),
     needs_review_only: Annotated[bool, typer.Option("--needs-review", "-n", help="Only review students marked needs_review=YES")] = False,
     all_students: Annotated[bool, typer.Option("--all", "-a", help="Review all students (including already approved)")] = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one.
 
     Shows score breakdown, opens submission file, and lets you approve or override scores.
-    Press 'e' to edit individual criterion scores.
+    Press 'e' to edit individual criterion scores, 'r' to open the rubric.
     """
     import json
     import os
@@ -445,6 +446,12 @@ def review(
         console.print(f"[red]Error:[/red] Scores file not found: {scores}")
         raise typer.Exit(1)
 
+    # Show rubric info
+    if rubric.exists():
+        console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
+    else:
+        console.print(f"[yellow]Warning: Rubric file not found: {rubric}[/yellow]")
+
     console.print(f"[bold]Loading spreadsheet:[/bold] {scores}")
     wb = openpyxl.load_workbook(scores)
     ws = wb.active
@@ -487,11 +494,13 @@ def review(
                 console.print(f"[bold blue]Submission:[/bold blue] {sub_file}")
             else:
                 console.print("[yellow]Warning: No submission file found[/yellow]")
+            if rubric.exists():
+                console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
             console.print()
 
             action = Prompt.ask(
                 "[bold cyan]Action[/bold cyan]",
-                choices=["a", "approve", "s", "skip", "e", "edit", "o", "open", "ov", "override", "q", "quit"],
+                choices=["a", "approve", "s", "skip", "e", "edit", "o", "open", "r", "rubric", "ov", "override", "q", "quit"],
                 default="skip"
             )
 
@@ -527,6 +536,13 @@ def review(
 
             elif action in ("o", "open") and sub_file:
                 open_file(sub_file)
+                continue
+
+            elif action in ("r", "rubric"):
+                if rubric.exists():
+                    open_file(rubric)
+                else:
+                    console.print(f"[yellow]Rubric file not found: {rubric}[/yellow]")
                 continue
 
             elif action in ("ov", "override"):
