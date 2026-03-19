@@ -184,41 +184,23 @@ def _needs_vision(text: str) -> bool:
 
 
 def _pdf_to_image_parts(data: bytes) -> list[dict]:
-    """Extract embedded images from a scanned PDF using pymupdf.
+    """Render PDF pages to images for vision model.
 
-    Uses page.get_images() to pull original scanner JPEG/PNG bytes directly —
-    no re-encoding, no quality loss, faster than rendering via get_pixmap().
-    Falls back to page rendering if no embedded images are found.
+    Always renders pages directly rather than trying to extract embedded images,
+    because PDFs often contain non-content images (ICC profiles, thumbnails, etc.)
+    that aren't student work. Rendering ensures we see exactly what a human sees.
     """
     import fitz  # pymupdf
     doc = fitz.open(stream=data, filetype="pdf")
     parts = []
-    seen: set[int] = set()
     for page in doc:
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            if xref in seen:
-                continue
-            seen.add(xref)
-            base_image = doc.extract_image(xref)
-            img_bytes = base_image["image"]
-            ext = base_image["ext"]  # "jpeg", "png", etc.
-            mime = "image/jpeg" if ext in ("jpeg", "jpg") else f"image/{ext}"
-            b64 = base64.b64encode(img_bytes).decode()
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"},
-            })
-    if not parts:
-        # No embedded images — fall back to rendering pages
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat)
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
-            })
+        mat = fitz.Matrix(2.0, 2.0)
+        pix = page.get_pixmap(matrix=mat)
+        b64 = base64.b64encode(pix.tobytes("png")).decode()
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+        })
     return parts
 
 
@@ -252,13 +234,13 @@ def _attachment_content_parts(attachment: Attachment) -> list[dict]:
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}},
         ]
 
-    # Scanned PDF — extract embedded images (original quality, no re-encoding)
+    # Scanned PDF — render pages to images
     if data[:4] == b'%PDF' or fname.endswith('.pdf'):
         try:
             img_parts = _pdf_to_image_parts(data)
             if img_parts:
                 return (
-                    [{"type": "text", "text": f"**File: {attachment.filename}** (scanned — images extracted)"}]
+                    [{"type": "text", "text": f"**File: {attachment.filename}** (scanned — pages rendered)"}]
                     + img_parts
                 )
         except Exception:
