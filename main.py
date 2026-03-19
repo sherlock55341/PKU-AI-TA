@@ -137,6 +137,17 @@ def grade(
                 console.print("  No submissions found.")
                 continue
 
+            # Filter out already graded submissions (from PKU website)
+            already_graded = [s for s in submissions if s.already_graded]
+            if already_graded:
+                console.print(f"  [dim]Skipping {len(already_graded)} already-graded submission(s):[/dim]")
+                for s in already_graded:
+                    console.print(f"    [dim]{s.student_id} {s.student_name}[/dim]")
+                submissions = [s for s in submissions if not s.already_graded]
+                if not submissions:
+                    console.print("  No ungraded submissions left to process.")
+                    continue
+
             # Filter out already processed submissions if resuming
             if processed_ids:
                 submissions = [s for s in submissions if s.student_id not in processed_ids]
