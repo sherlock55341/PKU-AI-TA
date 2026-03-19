@@ -270,36 +270,37 @@ def _parse_student_list(html: str) -> list[dict]:
     Handles two link formats:
     - CheckAloneWork.do href (older cohort, 查看)
     - onclick="checkWork('userId','filePk','attemptPk')" (newer cohort, 批改)
+
+    For students with multiple attempts, keeps the newest one (highest attemptPk).
     """
     names = {m.group(1): m.group(2).strip() for m in _NAME_PATTERN.finditer(html)}
-    students = []
-    seen: set[str] = set()
+    student_map: dict[str, dict] = {}  # userId -> best attempt
 
     for m in _STUDENT_PATTERN.finditer(html):
         _, user_id, file_pk, title_enc, attempt_pk = m.groups()
-        if user_id in seen:
-            continue
-        seen.add(user_id)
-        students.append({
+        attempt = {
             "userId": user_id,
             "filePk": file_pk,
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
-        })
+        }
+        # Keep the one with higher attemptPk (newer attempt)
+        if user_id not in student_map or int(attempt_pk) > int(student_map[user_id]["attemptPk"]):
+            student_map[user_id] = attempt
 
     for m in _STUDENT_ONCLICK_PATTERN.finditer(html):
         user_id, file_pk, attempt_pk = m.groups()
-        if user_id in seen:
-            continue
-        seen.add(user_id)
-        students.append({
+        attempt = {
             "userId": user_id,
             "filePk": file_pk,
             "attemptPk": attempt_pk,
             "name": names.get(user_id, "Unknown"),
-        })
+        }
+        # Keep the one with higher attemptPk (newer attempt)
+        if user_id not in student_map or int(attempt_pk) > int(student_map[user_id]["attemptPk"]):
+            student_map[user_id] = attempt
 
-    return students
+    return list(student_map.values())
 
 
 def _guess_mime(filename: str) -> str:
