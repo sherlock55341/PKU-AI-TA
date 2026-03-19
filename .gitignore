@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+student_list
+
+.pytest_cache
+.claude
+scores.xlsx
+rubric.md
+CLAUDE.md
+submissions/
+算分*.docx
+.~scores.xlsx

@@ -1,0 +1,33 @@
+[project]
+name = "pku-ai-ta"
+version = "0.1.0"
+description = "PKU AI Teaching Assistant — auto-grade student submissions from course.pku.edu.cn"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "openai>=1.30",
+    "openpyxl>=3.1",
+    "python-dotenv>=1.0",
+    "cryptography>=42.0",
+    "rich>=13.7",
+    "pypdf>=6.9.1",
+    "python-docx>=1.2.0",
+    "pymupdf>=1.27.2",
+]
+
+[project.scripts]
+ta = "main:app"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["auth", "crawler", "scorer", "review", "submitter"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
