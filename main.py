@@ -264,11 +264,14 @@ def review(
     rubric: Annotated[Path, typer.Option(help="Path to rubric file to open during review")] = Path("rubric.md"),
     needs_review_only: Annotated[bool, typer.Option("--needs-review", "-n", help="Only review students marked needs_review=YES")] = False,
     all_students: Annotated[bool, typer.Option("--all", "-a", help="Review all students (including already approved)")] = False,
+    auto_approve: Annotated[bool, typer.Option("--auto-approve", help="Auto-approve 100-point submissions that don't need review")] = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one.
 
     Shows score breakdown, opens submission file, and lets you approve or override scores.
     Press 'e' to edit individual criterion scores, 'r' to open the rubric.
+
+    Use --auto-approve to automatically approve students with 100/100 and needs_review=NO.
     """
     import json
     import os
@@ -476,6 +479,43 @@ def review(
 
     console.print(f"[green]Found {len(rows)} student(s) to review.[/green]")
     modified = False
+
+    # Auto-approve 100-point submissions that don't need review
+    if auto_approve:
+        auto_approved = 0
+        # Iterate all rows (not just filtered ones) to find auto-approve candidates
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not row[idx["student_id"]]:
+                continue
+            row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
+            # Check: 100 points, needs_review=NO, not already approved
+            total_score = float(row_data.get("total_score", 0) or 0)
+            total_max = float(row_data.get("total_max", 100) or 100)
+            needs_review = row_data.get("needs_review") == "YES"
+            already_approved = str(row_data.get("approved", "")).upper() == "YES"
+
+            if total_score >= total_max and not needs_review and not already_approved:
+                student_name = row_data.get("student_name", "")
+                student_id = row_data.get("student_id", "")
+                console.print(f"  [dim]Auto-approving:[/dim] {student_name} ({student_id}) — {total_score}/{total_max}")
+                ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
+                auto_approved += 1
+                modified = True
+
+        if auto_approved > 0:
+            console.print(f"[green]Auto-approved {auto_approved} student(s) with perfect scores.[/green]")
+            # Refresh the rows list since some may now be approved
+            rows = []
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                if not row[idx["student_id"]]:
+                    continue
+                row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
+                if needs_review_only and row_data.get("needs_review") != "YES":
+                    continue
+                if not all_students and str(row_data.get("approved", "")).upper() == "YES":
+                    continue
+                rows.append((row_idx, row_data))
+            console.print(f"[green]{len(rows)} student(s) remaining to review after auto-approve.[/green]")
 
     for i, (row_idx, row_data) in enumerate(rows, start=1):
         # Load breakdown first
