@@ -269,7 +269,7 @@ def review(
     """Interactive TUI for reviewing submissions one by one.
 
     Shows score breakdown, opens submission file, and lets you approve or override scores.
-    Press 'e' to edit individual criterion scores, 'r' to open the rubric.
+    Press 'e' to edit individual criterion scores, 'r' to open the rubric, 'b' to go back.
 
     Use --auto-approve to automatically approve students with 100/100 and needs_review=NO.
     """
@@ -517,7 +517,17 @@ def review(
                 rows.append((row_idx, row_data))
             console.print(f"[green]{len(rows)} student(s) remaining to review after auto-approve.[/green]")
 
-    for i, (row_idx, row_data) in enumerate(rows, start=1):
+    # We need to track the current index to allow going back
+    current_idx = 0
+    # Also store a dict of row_idx -> modified row_data for in-memory changes
+    modified_rows: dict[int, dict] = {}
+
+    while current_idx < len(rows):
+        row_idx, row_data_original = rows[current_idx]
+        # Use modified data if available, otherwise original
+        row_data = modified_rows.get(row_idx, row_data_original.copy())
+        i = current_idx + 1
+
         # Load breakdown first
         try:
             breakdown = json.loads(row_data.get("breakdown_json", "[]"))
@@ -538,21 +548,33 @@ def review(
                 console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
             console.print()
 
+            # Add 'b' and 'back' to choices
+            choices = ["a", "approve", "s", "skip", "e", "edit", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
+            if current_idx > 0:
+                choices.extend(["b", "back"])
+
             action = Prompt.ask(
                 "[bold cyan]Action[/bold cyan]",
-                choices=["a", "approve", "s", "skip", "e", "edit", "o", "open", "r", "rubric", "ov", "override", "q", "quit"],
+                choices=choices,
                 default="skip"
             )
 
             if action in ("q", "quit"):
                 console.print("[yellow]Quitting...[/yellow]")
+                current_idx = len(rows)  # Exit loop
                 break
+
+            if action in ("b", "back") and current_idx > 0:
+                current_idx -= 1
+                break  # Break inner loop to go to previous student
 
             if action in ("a", "approve"):
                 ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
                 row_data["approved"] = "YES"
+                modified_rows[row_idx] = row_data
                 modified = True
                 console.print("[green]Marked as approved.[/green]")
+                current_idx += 1
                 break
 
             elif action in ("e", "edit"):
@@ -570,6 +592,7 @@ def review(
                 ws.cell(row=row_idx, column=idx["total_score"] + 1, value=new_total)
                 ws.cell(row=row_idx, column=idx["total_max"] + 1, value=new_max)
                 ws.cell(row=row_idx, column=idx["pct"] + 1, value=row_data["pct"])
+                modified_rows[row_idx] = row_data
                 modified = True
                 console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
                 continue
@@ -593,8 +616,10 @@ def review(
                         ws.cell(row=row_idx, column=idx["reviewer_override_score"] + 1, value=score_val)
                         ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
                         row_data["approved"] = "YES"
+                        modified_rows[row_idx] = row_data
                         modified = True
                         console.print(f"[green]Set override score: {score_val} and marked as approved.[/green]")
+                        current_idx += 1
                         break
                     except ValueError:
                         console.print("[red]Invalid score[/red]")
@@ -602,10 +627,8 @@ def review(
 
             else:
                 console.print("[dim]Skipped.[/dim]")
+                current_idx += 1
                 break
-
-        if action in ("q", "quit"):
-            break
 
     if modified:
         console.print()
