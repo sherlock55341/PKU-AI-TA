@@ -31,12 +31,16 @@ def grade(
     save_dir: Annotated[Optional[Path], typer.Option(help="Save submission files here for human review; default: submissions/")] = Path("submissions"),
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores for each student")] = False,
     resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume from previous partial run (if any)")] = False,
+    regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Keep approved students, only regrade those not approved")] = False,
     lang: Annotated[str, typer.Option(help="LLM prompt language: en or zh")] = "en",
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
     Press Ctrl-C to interrupt; partial results will be saved to the output file
     and can be resumed with --resume.
+
+    Use --regrade-unapproved to keep already-approved students and only regrade
+    those that haven't been approved yet.
     """
     from threading import Lock
 
@@ -59,23 +63,34 @@ def grade(
             if all_results:
                 export(all_results, checkpoint_path)
 
-    def load_checkpoint() -> list[ScoringResult]:
-        """Load previous progress from output Excel file (if exists and --resume is set)."""
-        if resume and checkpoint_path.exists():
+    def load_checkpoint() -> tuple[list[ScoringResult], set[str]]:
+        """Load previous progress from output Excel file (if exists and --resume or --regrade-unapproved is set)."""
+        if (resume or regrade_unapproved) and checkpoint_path.exists():
             try:
                 from review.spreadsheet import load_reviewed
                 records = load_reviewed(checkpoint_path)
-                results = [r.result for r in records]
-                console.print(f"[bold cyan]Resuming from checkpoint:[/bold cyan] {len(results)} previously processed result(s)")
-                return results
+
+                if regrade_unapproved:
+                    # Keep only approved students, others will be regraded
+                    approved_results = [r.result for r in records if r.approved]
+                    all_results_loaded = [r.result for r in records]
+                    console.print(f"[bold cyan]Regrade mode:[/bold cyan] Loaded {len(all_results_loaded)} total, keeping {len(approved_results)} already-approved")
+                    return approved_results, {r.student_id for r in approved_results}
+                else:
+                    # Normal resume: keep all previously processed
+                    results = [r.result for r in records]
+                    console.print(f"[bold cyan]Resuming from checkpoint:[/bold cyan] {len(results)} previously processed result(s)")
+                    return results, {r.student_id for r in results}
             except Exception as e:
                 console.print(f"[yellow]Warning: Could not load checkpoint: {e}[/yellow]")
-        return []
+        return [], set()
 
-    # Load checkpoint if resuming
-    if resume:
-        all_results = load_checkpoint()
-        processed_ids = {r.student_id for r in all_results}
+    # Load checkpoint if resuming or regrading unapproved
+    if resume or regrade_unapproved:
+        all_results, processed_ids = load_checkpoint()
+    else:
+        all_results = []
+        processed_ids = set()
 
     # Resolve config — CLI args override .env
     course_id = course or settings.course_id
