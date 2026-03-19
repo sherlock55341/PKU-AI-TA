@@ -268,7 +268,11 @@ def score_submission(submission: Submission, rubric: str, language: str = "en") 
 
     extra: dict = {}
     if not settings.enable_thinking:
-        extra["extra_body"] = {"enable_thinking": False}
+        # Only send enable_thinking for Qwen models on platforms that support it
+        # Skip for Volcengine/other providers that don't support this parameter
+        model_name = settings.ta_model.lower()
+        if "qwen" in model_name and ("openrouter" in settings.openai_base_url or "dashscope" in settings.openai_base_url):
+            extra["extra_body"] = {"enable_thinking": False}
 
     response = _get_client().chat.completions.create(
         model=settings.ta_model,
