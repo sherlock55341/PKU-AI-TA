@@ -356,10 +356,29 @@ def review(
         info_table = Table(show_header=False, box=None)
         info_table.add_row("[bold]Student ID:[/]", str(row_data["student_id"]))
         info_table.add_row("[bold]Name:[/]", str(row_data["student_name"]))
-        info_table.add_row("[bold]Score:[/]", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+
+        # Show override score if present
+        override_score = row_data.get("reviewer_override_score")
+        if override_score is not None and override_score != "":
+            try:
+                override_val = float(override_score)
+                total_max = float(row_data["total_max"])
+                override_pct = round((override_val / total_max) * 100, 1) if total_max > 0 else 0
+                info_table.add_row("[bold]Score:[/]", f"[red][strike]{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)[/strike][/red]")
+                info_table.add_row("[bold]Override:[/]", f"[green]{override_val} / {total_max} ({override_pct}%)[/green]")
+            except (ValueError, TypeError):
+                info_table.add_row("[bold]Score:[/]", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+        else:
+            info_table.add_row("[bold]Score:[/]", f"{row_data['total_score']} / {row_data['total_max']} ({row_data['pct']}%)")
+
         info_table.add_row("[bold]Confidence:[/]", f"{row_data['confidence']}")
         info_table.add_row("[bold]Needs review:[/]", "[yellow]YES[/yellow]" if row_data["needs_review"] == "YES" else "NO")
         info_table.add_row("[bold]Current approved:[/]", "[green]YES[/green]" if str(row_data.get("approved", "")).upper() == "YES" else "[red]NO[/red]")
+        current_notes = str(row_data.get("reviewer_notes") or "")
+        if current_notes:
+            info_table.add_row("[bold]Reviewer notes:[/]", f"[green]{current_notes}[/green]")
+        else:
+            info_table.add_row("[bold]Reviewer notes:[/]", "[dim][yellow](none)[/yellow][/dim]")
         console.print(Panel(info_table, title="Student Info", border_style="cyan"))
 
         if breakdown is None:
@@ -578,9 +597,22 @@ def review(
             console.print()
 
             # Add 'b' and 'back' to choices
-            choices = ["a", "approve", "s", "skip", "e", "edit", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
+            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
             if current_idx > 0:
                 choices.extend(["b", "back"])
+
+            # Check if score is perfect (consider override if present)
+            total_max = float(row_data.get("total_max", 100) or 100)
+            override_score = row_data.get("reviewer_override_score")
+            if override_score is not None and override_score != "":
+                try:
+                    current_score = float(override_score)
+                except (ValueError, TypeError):
+                    current_score = float(row_data.get("total_score", 0) or 0)
+            else:
+                current_score = float(row_data.get("total_score", 0) or 0)
+            is_perfect = current_score >= total_max
+            has_notes = bool(str(row_data.get("reviewer_notes") or "").strip())
 
             action = Prompt.ask(
                 "[bold cyan]Action[/bold cyan]",
@@ -598,6 +630,20 @@ def review(
                 break  # Break inner loop to go to previous student
 
             if action in ("a", "approve"):
+                # Prompt for notes if score isn't perfect and no notes exist yet
+                if not is_perfect and not has_notes:
+                    console.print("\n[yellow]Score is not 100%. Please add reviewer notes.[/yellow]")
+                    current_notes = str(row_data.get("reviewer_notes") or "")
+                    new_notes = Prompt.ask("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes)
+                    if new_notes.strip():
+                        row_data["reviewer_notes"] = new_notes
+                        ws.cell(row=row_idx, column=idx["reviewer_notes"] + 1, value=new_notes)
+                        modified_rows[row_idx] = row_data
+                        modified = True
+                        has_notes = True
+                        console.print("[green]Added reviewer notes.[/green]")
+                    else:
+                        console.print("[yellow]No notes added. You can still add notes later.[/yellow]")
                 ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
                 row_data["approved"] = "YES"
                 modified_rows[row_idx] = row_data
@@ -605,6 +651,18 @@ def review(
                 console.print("[green]Marked as approved.[/green]")
                 current_idx += 1
                 break
+
+            elif action in ("n", "notes"):
+                current_notes = str(row_data.get("reviewer_notes") or "")
+                console.print(f"\n[bold]Current notes:[/bold] {current_notes if current_notes else '(none)'}")
+                new_notes = Prompt.ask("[bold cyan]Enter reviewer notes[/bold cyan]", default=current_notes)
+                row_data["reviewer_notes"] = new_notes
+                ws.cell(row=row_idx, column=idx["reviewer_notes"] + 1, value=new_notes)
+                modified_rows[row_idx] = row_data
+                modified = True
+                has_notes = bool(new_notes.strip())
+                console.print("[green]Updated reviewer notes.[/green]")
+                continue
 
             elif action in ("e", "edit"):
                 if not breakdown:
@@ -638,10 +696,14 @@ def review(
                 continue
 
             elif action in ("ov", "override"):
-                new_score = Prompt.ask("[bold cyan]Enter override score[/bold cyan]")
+                current_override = row_data.get("reviewer_override_score", "")
+                if current_override:
+                    console.print(f"\n[bold]Current override:[/bold] {current_override}")
+                new_score = Prompt.ask("[bold cyan]Enter override score[/bold cyan]", default=str(current_override) if current_override else "")
                 if new_score:
                     try:
                         score_val = float(new_score)
+                        row_data["reviewer_override_score"] = score_val
                         ws.cell(row=row_idx, column=idx["reviewer_override_score"] + 1, value=score_val)
                         ws.cell(row=row_idx, column=idx["approved"] + 1, value="YES")
                         row_data["approved"] = "YES"
