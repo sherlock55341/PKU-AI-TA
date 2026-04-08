@@ -45,8 +45,9 @@ BB_API = "/learn/api/public/v1"
 #   1. href="...CheckAloneWork.do?...userId=X&filePk=Y&...&attemptPk=Z">查看</a> (already graded)
 #   2. onclick="checkWork('userId','filePk','attemptPk')">批改</a> (needs grading)
 _STUDENT_PATTERN = re.compile(
-    r'<a[^>]*CheckAloneWork\.do\?course_id=[^&]+&gradeBookPK=(\d+)'
-    r'&userId=(\d+)&filePk=(\d+)&title=([^&"]+)&attemptPk=(\d+)[^>]*>([^<]+)</a>'
+    r'<a[^>]*?(?:CheckAloneWork|CheckWork)\.do\?[^"\']*?'
+    r'userId=(\d+)[^"\']*?filePk=(\d+)[^"\']*?attemptPk=(\d+)[^>]*>([^<]+)</a>',
+    re.IGNORECASE,
 )
 _STUDENT_ONCLICK_PATTERN = re.compile(
     r"""onclick=['"]\s*checkWork\(\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*,\s*['"](\d+)['"]\s*\)[^>]*>([^<]+)</a>"""
@@ -294,7 +295,7 @@ def _parse_student_list(html: str) -> list[dict]:
     student_map: dict[str, dict] = {}  # userId -> best attempt
 
     for m in _STUDENT_PATTERN.finditer(html):
-        _, user_id, file_pk, title_enc, attempt_pk, link_text = m.groups()
+        user_id, file_pk, attempt_pk, link_text = m.groups()
         already_graded = link_text.strip() == "查看"
         attempt = {
             "userId": user_id,

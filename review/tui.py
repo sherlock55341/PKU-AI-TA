@@ -129,6 +129,7 @@ def run_review_tui(
     needs_review_only: bool = False,
     all_students: bool = False,
     auto_approve: bool = False,
+    auto_approve_safe: bool = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one."""
     if not scores.exists():
@@ -149,8 +150,13 @@ def run_review_tui(
 
     console.print(f"[green]Found {len(session.rows)} student(s) to review.[/green]")
 
-    if auto_approve:
-        if auto_approve_students(session.ws, session.idx, console):
+    if auto_approve or auto_approve_safe:
+        if auto_approve_students(
+            session.ws,
+            session.idx,
+            console,
+            approve_all_safe=auto_approve_safe,
+        ):
             # Save the changes before reloading
             session.wb.save(scores)
             session = ReviewSession(scores, needs_review_only, all_students)
@@ -234,4 +240,3 @@ def run_review_tui(
             console.print("[yellow]Changes not saved.[/yellow]")
     else:
         console.print("[dim]No changes made.[/dim]")
-

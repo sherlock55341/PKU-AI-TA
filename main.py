@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Annotated, Optional
 from time import time
+import re
 
 import typer
 from rich.console import Console
@@ -47,6 +48,7 @@ def grade(
 
     from auth.iaaa import get_session
     from config import settings
+    from crawler.blackboard import BlackboardCrawler
     from crawler.pku_homework import PKUHomeworkCrawler
     from review.spreadsheet import export
     from scorer.llm import score_submission
@@ -131,14 +133,39 @@ def grade(
     console.print("[bold]Step 1/3:[/bold] Authenticating with PKU IAAA…")
     client = get_session()
 
-    crawler = PKUHomeworkCrawler(client, course_id, whitelist_ids)
+    pku_crawler = PKUHomeworkCrawler(client, course_id, whitelist_ids)
+    bb_crawler = BlackboardCrawler(client, course_id, whitelist_ids)
 
     if column:
-        # column here is expected to be gradeBookPK (numeric), e.g. "423829"
-        columns = [{"gradeBookPK": column, "name": column, "id": f"_{column}_1"}]
+        grade_book_pk, column_id = _normalize_column_identifiers(column)
+        assignment_title = column
+        source = "pku"
+        try:
+            assignments = pku_crawler.fetch_assignments()
+            for assignment in assignments:
+                if assignment.get("gradeBookPK") == grade_book_pk or assignment.get("id") == column_id:
+                    assignment_title = assignment.get("name") or assignment_title
+                    break
+            else:
+                source = "bb"
+        except Exception:
+            # If the PKU homework plugin listing fails, try standard Blackboard.
+            source = "bb"
+
+        if source == "bb":
+            try:
+                assignments = bb_crawler.fetch_assignments()
+                for assignment in assignments:
+                    if assignment.get("id") == column_id:
+                        assignment_title = assignment.get("name") or assignment.get("title") or assignment_title
+                        break
+            except Exception:
+                pass
+
+        columns = [{"gradeBookPK": grade_book_pk, "name": assignment_title, "id": column_id, "source": source}]
     else:
         console.print("[bold]Step 1b:[/bold] Fetching assignment list…")
-        columns = crawler.fetch_assignments()
+        columns = pku_crawler.fetch_assignments()
         console.print(f"  Found {len(columns)} assignment(s).")
 
     interrupted = False
@@ -148,9 +175,24 @@ def grade(
         for col in columns:
             grade_book_pk = col.get("gradeBookPK") or col["id"].strip("_").split("_")[0]
             col_title = col.get("name") or col["id"]
+            source = col.get("source", "pku")
             console.print(f"\n[bold]Step 2/3:[/bold] Fetching submissions for [cyan]{col_title}[/cyan]…")
 
-            submissions = crawler.fetch_submissions(grade_book_pk, col_title)
+            if source == "bb":
+                submissions = bb_crawler.fetch_submissions(col["id"], col_title)
+            else:
+                submissions = pku_crawler.fetch_submissions(grade_book_pk, col_title)
+
+                if column and not submissions:
+                    try:
+                        bb_submissions = bb_crawler.fetch_submissions(col["id"], col_title)
+                    except Exception:
+                        bb_submissions = []
+                    if bb_submissions:
+                        submissions = bb_submissions
+                        source = "bb"
+                        console.print("  [dim]No PKU plugin submissions found; using Blackboard assignment attempts instead.[/dim]")
+
             if not submissions:
                 console.print("  No submissions found.")
                 continue
@@ -234,7 +276,9 @@ def grade(
                                     f"[{color}]{status}[/]"
                                 )
                         except Exception as e:
-                            console.print(f"  [red]Error scoring {sub.student_id}:[/red] {e}")
+                            console.print(
+                                f"  [red]Error scoring {sub.student_id}:[/red] {_summarize_error(e)}"
+                            )
                         finally:
                             progress.advance(task)
 
@@ -312,28 +356,65 @@ def submit(
     from submitter.blackboard import submit_scores
 
     course_id = course or settings.course_id
-    if not course_id or not column:
-        console.print("[red]Error:[/red] Both --course and --column are required.")
+    if not course_id:
+        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env).")
         raise typer.Exit(1)
-    # BB REST API needs _423829_1 format; accept bare numeric gradeBookPK too
-    col_id = column if column.startswith("_") else f"_{column}_1"
 
     if not scores.exists():
         console.print(f"[red]Error:[/red] Scores file not found: {scores}")
         raise typer.Exit(1)
 
     records = load_reviewed(scores)
-    approved_count = sum(1 for r in records if r.approved)
-    console.print(f"Loaded {len(records)} record(s), {approved_count} approved.")
+    assignment_ids = sorted({r.result.assignment_id for r in records if r.result.assignment_id})
+    selected_column = column.strip()
+    if not selected_column:
+        if len(assignment_ids) == 1:
+            selected_column = assignment_ids[0]
+            console.print(f"[dim]Using assignment ID from spreadsheet:[/dim] {selected_column}")
+        else:
+            console.print("[red]Error:[/red] --column is required when the spreadsheet contains multiple assignments.")
+            raise typer.Exit(1)
+
+    _, selected_col_id = _normalize_column_identifiers(selected_column)
+    filtered_records = [r for r in records if _column_matches_assignment(selected_col_id, r.result.assignment_id)]
+
+    if not filtered_records and len(assignment_ids) == 1:
+        spreadsheet_column = assignment_ids[0]
+        _, spreadsheet_col_id = _normalize_column_identifiers(spreadsheet_column)
+        console.print(
+            f"[yellow]Warning:[/yellow] CLI --column {selected_column} does not match spreadsheet assignment "
+            f"{spreadsheet_column}; using the spreadsheet assignment."
+        )
+        selected_col_id = spreadsheet_col_id
+        filtered_records = records
+    elif not filtered_records:
+        console.print("[red]Error:[/red] No records in the spreadsheet match the requested --column.")
+        raise typer.Exit(1)
+
+    if len(filtered_records) != len(records):
+        console.print(f"[yellow]Using {len(filtered_records)}/{len(records)} record(s) matching column {selected_col_id}.[/yellow]")
+
+    approved_count = sum(1 for r in filtered_records if r.approved)
+    console.print(f"Loaded {len(filtered_records)} record(s), {approved_count} approved.")
 
     if approved_count == 0:
         console.print("[yellow]Nothing to submit — no records marked approved.[/yellow]")
         raise typer.Exit(0)
 
+    approved_student_ids = [r.result.student_id for r in filtered_records if r.approved]
+    duplicate_student_ids = sorted({sid for sid in approved_student_ids if approved_student_ids.count(sid) > 1})
+    if duplicate_student_ids:
+        console.print(
+            "[red]Error:[/red] Duplicate approved student IDs found in the spreadsheet: "
+            + ", ".join(duplicate_student_ids)
+        )
+        console.print("[yellow]Regenerate the scores file or remove duplicate rows before submitting.[/yellow]")
+        raise typer.Exit(1)
+
     console.print("[bold]Authenticating with PKU IAAA…[/bold]")
     client = get_session()
 
-    submit_scores(client, course_id, col_id, records, dry_run=dry_run)
+    submit_scores(client, course_id, selected_col_id, filtered_records, dry_run=dry_run)
 
 
 @app.command()
@@ -344,6 +425,7 @@ def review(
     needs_review_only: Annotated[bool, typer.Option("--needs-review", "-n", help="Only review students marked needs_review=YES")] = False,
     all_students: Annotated[bool, typer.Option("--all", "-a", help="Review all students (including already approved)")] = False,
     auto_approve: Annotated[bool, typer.Option("--auto-approve", help="Auto-approve 100-point submissions that don't need review")] = False,
+    auto_approve_safe: Annotated[bool, typer.Option("--auto-approve-safe", help="Auto-approve all submissions with needs_review=NO")] = False,
 ) -> None:
     """Interactive TUI for reviewing submissions one by one.
 
@@ -351,6 +433,7 @@ def review(
     Press 'e' to edit individual criterion scores, 'r' to open the rubric, 'b' to go back.
 
     Use --auto-approve to automatically approve students with 100/100 and needs_review=NO.
+    Use --auto-approve-safe to automatically approve all students with needs_review=NO.
     """
     from review.tui import run_review_tui
 
@@ -363,6 +446,7 @@ def review(
             needs_review_only=needs_review_only,
             all_students=all_students,
             auto_approve=auto_approve,
+            auto_approve_safe=auto_approve_safe,
         )
     except FileNotFoundError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -389,6 +473,37 @@ def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) 
             safe_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', sub.student_name)
             filename = f"{sub.student_id}_{safe_name}{ext}"
             (dest / filename).write_bytes(att.data)
+
+
+def _normalize_column_identifiers(column: str) -> tuple[str, str]:
+    """Accept either numeric gradeBookPK or Blackboard `_423829_1` column ID."""
+    value = column.strip()
+    if re.fullmatch(r"\d+", value):
+        return value, f"_{value}_1"
+
+    match = re.fullmatch(r"_(\d+)_\d+", value)
+    if match:
+        grade_book_pk = match.group(1)
+        return grade_book_pk, value
+
+    return value, value if value.startswith("_") else f"_{value}_1"
+
+
+def _column_matches_assignment(column_id: str, assignment_id: str) -> bool:
+    _, normalized_assignment = _normalize_column_identifiers(assignment_id)
+    return normalized_assignment == column_id
+
+
+def _summarize_error(exc: Exception, limit: int = 240) -> str:
+    text = " ".join(str(exc).split())
+    if "<!DOCTYPE html" in text:
+        status_match = re.search(r"\b(\d{3})\b", text)
+        status = status_match.group(1) if status_match else "unknown"
+        if "bad gateway" in text.lower():
+            text = f"upstream API returned HTTP {status} Bad Gateway"
+        else:
+            text = f"upstream API returned HTML error page (HTTP {status})"
+    return text[:limit] + ("..." if len(text) > limit else "")
 
 
 if __name__ == "__main__":

@@ -153,21 +153,29 @@ def load_review_data(
     
     return wb, idx, rows
 
-def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
-    """Auto-approve students with perfect scores who don't need review."""
+def auto_approve_students(ws: Any, idx: dict, console: Console, *, approve_all_safe: bool = False) -> bool:
+    """Auto-approve students who do not need review.
+
+    By default, only perfect-score submissions are auto-approved.
+    When approve_all_safe is True, all submissions with needs_review=NO are auto-approved.
+    """
     auto_approved = 0
     modified = False
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if not row[idx["student_id"]]:
             continue
         row_data = {name: row[i] if i < len(row) else None for name, i in idx.items()}
-        # Check: 100 points, needs_review=NO, not already approved
         total_score = float(row_data.get("total_score", 0) or 0)
         total_max = float(row_data.get("total_max", 100) or 100)
         needs_review = row_data.get("needs_review") == "YES"
         already_approved = str(row_data.get("approved", "")).upper() == "YES"
 
-        if total_score >= total_max and not needs_review and not already_approved:
+        should_approve = (
+            not needs_review
+            and not already_approved
+            and (approve_all_safe or total_score >= total_max)
+        )
+        if should_approve:
             student_name = row_data.get("student_name", "")
             student_id = row_data.get("student_id", "")
             console.print(f"  [dim]Auto-approving:[/dim] {student_name} ({student_id}) — {total_score}/{total_max}")
@@ -176,7 +184,10 @@ def auto_approve_students(ws: Any, idx: dict, console: Console) -> bool:
             modified = True
 
     if auto_approved > 0:
-        console.print(f"[green]Auto-approved {auto_approved} student(s) with perfect scores.[/green]")
+        if approve_all_safe:
+            console.print(f"[green]Auto-approved {auto_approved} student(s) with needs_review=NO.[/green]")
+        else:
+            console.print(f"[green]Auto-approved {auto_approved} student(s) with perfect scores.[/green]")
     
     return modified
 

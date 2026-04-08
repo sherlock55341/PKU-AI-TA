@@ -149,6 +149,9 @@ uv run python main.py review --all
 
 # Auto-approve perfect scores, then review the rest
 uv run python main.py review --auto-approve --needs-review
+
+# Auto-approve all submissions with needs_review=NO, then review the rest
+uv run python main.py review --auto-approve-safe --all
 ```
 
 TUI key bindings:
@@ -173,6 +176,7 @@ TUI key bindings:
 | `--needs-review` / `-n` | Only show students flagged as needing review |
 | `--all` / `-a` | Show all students, including already-approved |
 | `--auto-approve` | Automatically approve 100/100 students with no uncertain parts |
+| `--auto-approve-safe` | Automatically approve all students with `needs_review=NO` |
 
 #### Option B: Edit Excel directly
 
