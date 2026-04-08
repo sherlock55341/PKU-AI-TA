@@ -79,6 +79,9 @@ Create `rubric.md` describing the scoring criteria. Example:
 Crawl submissions, score with LLM, and export a review spreadsheet:
 
 ```bash
+# List all assignments in the course with their gradeBookPK values
+uv run python main.py list-assignments --course _98024_1
+
 # Grade all students in the course
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 
@@ -125,6 +128,13 @@ This produces `scores.xlsx`. Rows highlighted **yellow** have low LLM confidence
 > …/getStudentWork.do?course_id=_98024_1&gradeBookPK=423829&title=第一次作业
 > ```
 > Copy the bare number after `gradeBookPK=`, e.g. `423829`.
+>
+> **Listing all assignments first (recommended):**
+> Run:
+> ```bash
+> uv run python main.py list-assignments --course _98024_1
+> ```
+> This prints each assignment title, its numeric `gradeBookPK`, and the Blackboard-style column ID such as `_423829_1`.
 
 ### Step 2 — Review
 

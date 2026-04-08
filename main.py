@@ -3,6 +3,7 @@ PKU AI Teaching Assistant CLI
 
 Commands:
   ta grade   --course <id> --column <id> --rubric <file> [--whitelist a,b,c] [--out scores.xlsx] [--verbose] [--resume] [--lang en|zh]
+  ta list-assignments [--course <id>]
   ta review  [--scores scores.xlsx] [--submissions submissions/] [--needs-review] [--all]
   ta submit  --course <id> --column <id> --scores <reviewed.xlsx> [--dry-run]
 """
@@ -260,6 +261,41 @@ def grade(
         f"(highlighted in yellow in the spreadsheet)."
     )
     console.print(f"Review the spreadsheet, set [bold]approved[/bold] = YES, then run [bold]ta submit[/bold].")
+
+
+@app.command()
+def list_assignments(
+    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
+) -> None:
+    """List all assignments in the course with their gradeBookPK values."""
+    from auth.iaaa import get_session
+    from config import settings
+    from crawler.pku_homework import PKUHomeworkCrawler
+
+    course_id = course or settings.course_id
+    if not course_id:
+        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
+        raise typer.Exit(1)
+
+    console.print("[bold]Authenticating with PKU IAAA…[/bold]")
+    client = get_session()
+
+    crawler = PKUHomeworkCrawler(client, course_id, whitelist=set())
+    console.print("[bold]Fetching assignment list…[/bold]")
+    assignments = crawler.fetch_assignments()
+
+    if not assignments:
+        console.print("[yellow]No assignments found.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"Found {len(assignments)} assignment(s):")
+    for idx, assignment in enumerate(assignments, start=1):
+        grade_book_pk = assignment.get("gradeBookPK", "")
+        title = assignment.get("name") or assignment.get("id", "")
+        col_id = assignment.get("id") or (f"_{grade_book_pk}_1" if grade_book_pk else "")
+        console.print(f"{idx}. {title}")
+        console.print(f"   gradeBookPK: {grade_book_pk}")
+        console.print(f"   column id:   {col_id}")
 
 
 @app.command()

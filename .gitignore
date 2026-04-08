@@ -19,3 +19,5 @@ CLAUDE.md
 submissions/
 算分*.docx
 .~scores.xlsx
+*.pdf
+.codex
