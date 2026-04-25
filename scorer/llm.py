@@ -115,6 +115,26 @@ def _create_completion_with_retries(**kwargs):
 _DEFAULT_PROMPT = _PROMPTS_DIR / "system_en.md"
 
 
+def configure_api_backend(
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    enable_thinking: bool | None = None,
+) -> None:
+    """Override OpenAI-compatible API settings for the current process."""
+    global _client
+    if base_url is not None:
+        settings.openai_base_url = base_url
+    if api_key is not None:
+        settings.openai_api_key = api_key
+    if model is not None:
+        settings.ta_model = model
+    if enable_thinking is not None:
+        settings.enable_thinking = enable_thinking
+    _client = None
+
+
 def get_system_prompt(path: Path) -> str:
     """Load the system prompt from a file path."""
     if path.exists():
@@ -424,6 +444,30 @@ def _submission_content_groups(submission: Submission) -> list[list[dict]]:
     return groups
 
 
+def submission_text_for_prompt(submission: Submission) -> str:
+    """Build a text-only representation of a submission for non-vision backends."""
+    sections: list[str] = []
+    if submission.text_content.strip():
+        sections.append(f"## Text answer\n\n{submission.text_content.strip()}")
+
+    for attachment in submission.attachments:
+        if _is_archive_attachment(attachment):
+            extracted = _extract_archive_attachments(attachment)
+            if not extracted:
+                sections.append(f"## Archive: {attachment.filename}\n\n(No supported files extracted from archive)")
+                continue
+            sections.append(f"## Archive: {attachment.filename}\n\nExtracted {len(extracted)} supported file(s).")
+            for inner in extracted:
+                text = _extract_text(inner)
+                sections.append(f"### File: {inner.filename}\n\n{text}")
+            continue
+
+        text = _extract_text(attachment)
+        sections.append(f"## File: {attachment.filename}\n\n{text}")
+
+    return "\n\n".join(sections) if sections else "(No submission content found.)"
+
+
 def _score_from_content(system_prompt: str, rubric: str, content: list[dict], extra: dict) -> dict:
     response = _create_completion_with_retries(
         model=settings.ta_model,
@@ -525,6 +569,11 @@ def score_submission(submission: Submission, rubric: str, prompt: Path = _DEFAUL
             raise
         data = _score_from_chunk_summaries(system_prompt, rubric, _pack_groups(groups, _MAX_CHUNK_REQUEST_CHARS), extra)
 
+    return scoring_result_from_data(submission, data)
+
+
+def scoring_result_from_data(submission: Submission, data: dict) -> ScoringResult:
+    """Convert model JSON into a ScoringResult for any scoring backend."""
     def _f(val, default: float = 0.0) -> float:
         return float(val) if val is not None else default
 

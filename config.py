@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     # LLM (OpenAI-compatible)
     openai_base_url: str = "https://openrouter.ai/api/v1"
-    openai_api_key: str
+    openai_api_key: str = ""
     ta_model: str = "qwen/qwen3.5-397b-a17b"
     # Disable chain-of-thought thinking tokens (Qwen3 series); faster + cheaper
     enable_thinking: bool = False

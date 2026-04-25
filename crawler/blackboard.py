@@ -21,7 +21,11 @@ Relevant endpoints used:
 from __future__ import annotations
 
 import re
+import ssl
+import time
 from html import unescape
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -41,6 +45,22 @@ _SUBMISSION_TEXT_BLOCK_RE = re.compile(
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_ANCHOR_RE = re.compile(r'<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
+_HREF_RE = re.compile(r'''href\s*=\s*["'](?P<href>[^"']+)["']''', re.IGNORECASE)
+_COURSE_ID_RE = re.compile(r"course_id=(_\d+_\d+)")
+_PKID_COURSE_ID_RE = re.compile(r"PkId\{key=(_\d+_\d+),\s*dataType=blackboard\.data\.course\.Course")
+_TITLE_RE = re.compile(r"<title[^>]*>(?P<title>.*?)</title>", re.DOTALL | re.IGNORECASE)
+_TOKEN_VALUE_RE = re.compile(r"(?i)(token=)[^&\"'\s<>]+")
+_SESSION_VALUE_RE = re.compile(r"(?i)(session|nonce|auth)[^\"'\s<>]*")
+
+COURSE_DISCOVERY_PATHS = (
+    "/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_1_1",
+    "/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_2_1",
+    "/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_3_1",
+    "/webapps/blackboard/execute/courseManager?sourceType=COURSES",
+    "/webapps/blackboard/execute/launcher?type=Course",
+    "/",
+)
 
 
 class BlackboardCrawler:
@@ -192,20 +212,163 @@ class BlackboardCrawler:
 
     def _paginate(self, path: str, params: dict | None = None) -> list[dict]:
         """Follow Blackboard's cursor-based pagination."""
-        params = dict(params or {})
-        params.setdefault("limit", "100")
-        results: list[dict] = []
-        url: str | None = path
+        return _paginate(self.client, path, params)
 
-        while url:
-            resp = self.client.get(url, params=params if url == path else None)
+
+def fetch_courses(client: httpx.Client) -> list[dict]:
+    """Return courses visible to the authenticated Blackboard user."""
+    web_courses = fetch_courses_from_web(client)
+    if web_courses:
+        return web_courses
+    return _paginate(
+        client,
+        f"{BB_API}/courses",
+        params={"fields": "id,courseId,name,availability.available"},
+        timeout=8,
+    )
+
+
+def fetch_courses_from_web(client: httpx.Client) -> list[dict]:
+    """Parse Blackboard web pages for course links with course_id query values."""
+    courses: list[dict] = []
+    seen: set[str] = set()
+    for path in COURSE_DISCOVERY_PATHS:
+        try:
+            resp = client.get(path, timeout=8)
             resp.raise_for_status()
-            body = resp.json()
-            results.extend(body.get("results", []))
-            paging = body.get("paging", {})
-            url = paging.get("nextPage")  # None when last page
+        except httpx.HTTPError:
+            continue
+        for course in _parse_course_links(resp.text):
+            course_id = course["id"]
+            if course_id in seen:
+                continue
+            seen.add(course_id)
+            courses.append(course)
+    return courses
 
-        return results
+
+def debug_course_discovery(client: httpx.Client, output: Path) -> list[dict]:
+    """Fetch candidate Blackboard course pages and save sanitized diagnostics."""
+    diagnostics: list[dict] = []
+    html_parts: list[str] = []
+    for path in COURSE_DISCOVERY_PATHS:
+        entry = {
+            "path": path,
+            "status": None,
+            "title": "",
+            "course_links": [],
+            "error": "",
+        }
+        try:
+            resp = client.get(path, timeout=8)
+            entry["status"] = resp.status_code
+            entry["title"] = _parse_html_title(resp.text)
+            links = _parse_course_links(resp.text)
+            entry["course_links"] = links
+            html_parts.append(
+                f"\n<!-- PATH: {path} STATUS: {resp.status_code} TITLE: {entry['title']} -->\n"
+                + sanitize_debug_html(resp.text[:200000])
+            )
+        except Exception as exc:
+            entry["error"] = f"{exc.__class__.__name__}: {exc}"
+        diagnostics.append(entry)
+
+    output.write_text("\n\n".join(html_parts), encoding="utf-8")
+    return diagnostics
+
+
+def _paginate(
+    client: httpx.Client,
+    path: str,
+    params: dict | None = None,
+    timeout: float | None = None,
+) -> list[dict]:
+    """Follow Blackboard's cursor-based pagination for a client and API path."""
+    params = dict(params or {})
+    params.setdefault("limit", "100")
+    results: list[dict] = []
+    url: str | None = path
+
+    while url:
+        kwargs = {"params": params if url == path else None}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = _get_with_retries(client, url, **kwargs)
+        resp.raise_for_status()
+        body = resp.json()
+        results.extend(body.get("results", []))
+        paging = body.get("paging", {})
+        url = paging.get("nextPage")  # None when last page
+
+    return results
+
+
+def _parse_course_links(html: str) -> list[dict]:
+    """Extract course metadata from Blackboard HTML links containing course_id."""
+    courses: list[dict] = []
+    seen: set[str] = set()
+
+    for match in _ANCHOR_RE.finditer(html):
+        href_match = _HREF_RE.search(match.group("attrs"))
+        if not href_match:
+            continue
+        href = unescape(href_match.group("href"))
+        course_id = _course_id_from_href(href)
+        if not course_id or course_id in seen:
+            continue
+        title = _normalize_html_text(match.group("body"))
+        if not title:
+            title = course_id
+        seen.add(course_id)
+        courses.append({"id": course_id, "name": title, "courseId": "", "source": "web"})
+
+    return courses
+
+
+def _parse_html_title(html: str) -> str:
+    match = _TITLE_RE.search(html)
+    if not match:
+        return ""
+    return _normalize_html_text(match.group("title"))
+
+
+def sanitize_debug_html(html: str) -> str:
+    """Redact likely sensitive values from saved debug HTML."""
+    redacted = _TOKEN_VALUE_RE.sub(r"\1<redacted>", html)
+    redacted = re.sub(r'(?i)(password|passwd|pwd)\s*=\s*["\'][^"\']+["\']', r'\1="<redacted>"', redacted)
+    redacted = re.sub(r'(?i)(value\s*=\s*["\'])([^"\']{24,})(["\'])', r'\1<redacted>\3', redacted)
+    redacted = _SESSION_VALUE_RE.sub("<redacted>", redacted)
+    return redacted
+
+
+def _course_id_from_href(href: str) -> str:
+    parsed = urlparse(href)
+    query = parse_qs(parsed.query)
+    values = query.get("course_id") or query.get("courseId") or []
+    for value in values:
+        if re.fullmatch(r"_\d+_\d+", value):
+            return value
+
+    match = _COURSE_ID_RE.search(href)
+    if match:
+        return match.group(1)
+
+    match = _PKID_COURSE_ID_RE.search(unescape(href))
+    return match.group(1) if match else ""
+
+
+def _get_with_retries(client: httpx.Client, url: str, attempts: int = 3, **kwargs) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.get(url, **kwargs)
+        except (httpx.HTTPError, ssl.SSLError, OSError) as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("GET request failed without an exception")
 
 
 def _parse_assignment_attachment_links(html: str) -> list[tuple[str, str]]:

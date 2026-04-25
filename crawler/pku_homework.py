@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import io
 import re
+import ssl
+import time
 import zipfile
 from urllib.parse import quote, unquote
 
@@ -72,7 +74,8 @@ class PKUHomeworkCrawler:
 
     def fetch_assignments(self) -> list[dict]:
         """Return list of assignments: [{id, name, gradeBookPK}, ...]."""
-        resp = self.client.get(
+        resp = _get_with_retries(
+            self.client,
             f"{HW_BASE}/getHomeWorkList.do",
             params={"course_id": self.course_id},
         )
@@ -336,3 +339,17 @@ def _guess_mime(filename: str) -> str:
         "jpeg": "image/jpeg",
         "png": "image/png",
     }.get(ext, "application/octet-stream")
+
+
+def _get_with_retries(client: httpx.Client, url: str, *, params: dict | None = None, attempts: int = 3) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.get(url, params=params)
+        except (httpx.HTTPError, ssl.SSLError, OSError) as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("GET request failed without an exception")

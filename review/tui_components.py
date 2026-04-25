@@ -7,11 +7,15 @@ import json
 import os
 import subprocess
 import sys
+import termios
+import tty
 from pathlib import Path
 from typing import Any
 
 import openpyxl
 from rich.console import Console
+from rich.console import Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -293,6 +297,30 @@ def handle_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown:
     console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
     return breakdown
 
+
+def handle_batch_edit(session: ReviewSession, row_idx: int, row_data: dict, breakdown: list, console: Console) -> list:
+    """Handle batch editing of multiple criterion scores."""
+    if not breakdown:
+        console.print("[yellow]No breakdown data to edit[/yellow]")
+        return breakdown
+    new_breakdown = batch_edit_breakdown(console, breakdown)
+    if new_breakdown is breakdown:
+        return breakdown
+
+    new_total, new_max = calculate_breakdown_totals(new_breakdown)
+    row_data["breakdown_json"] = json.dumps(new_breakdown)
+    row_data["total_score"] = new_total
+    row_data["total_max"] = new_max
+    row_data["pct"] = round((new_total / new_max) * 100, 1) if new_max > 0 else 0
+    session.ws.cell(row=row_idx, column=session.idx["breakdown_json"] + 1, value=row_data["breakdown_json"])
+    session.ws.cell(row=row_idx, column=session.idx["total_score"] + 1, value=new_total)
+    session.ws.cell(row=row_idx, column=session.idx["total_max"] + 1, value=new_max)
+    session.ws.cell(row=row_idx, column=session.idx["pct"] + 1, value=row_data["pct"])
+    session.update_row(row_idx, row_data)
+    console.print(f"[green]Updated total score: {new_total} / {new_max}[/green]")
+    return new_breakdown
+
+
 def handle_override(session: ReviewSession, row_idx: int, row_data: dict, console: Console) -> None:
     """Handle the 'override' action. Sets override score and stays on current student."""
     current_override = row_data.get("reviewer_override_score", "")
@@ -309,6 +337,193 @@ def handle_override(session: ReviewSession, row_idx: int, row_data: dict, consol
         except ValueError:
             console.print("[red]Invalid score[/red]")
 
+def calculate_breakdown_totals(breakdown: list) -> tuple[float, float]:
+    """Return total awarded and max points for a breakdown list."""
+    total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
+    max_total = sum(float(b.get("points_max", 0)) for b in breakdown)
+    return total, max_total
+
+
+def apply_batch_scores(breakdown: list, raw: str) -> tuple[list, list[str]]:
+    """Apply batch score edits.
+
+    Supported formats:
+    - "1=8,2=6,5=0" updates explicit criterion numbers.
+    - "8,6,,10" updates criteria in order; blanks keep existing scores.
+    """
+    updated = [dict(item) for item in breakdown]
+    errors: list[str] = []
+    text = raw.strip()
+    if not text:
+        return updated, errors
+
+    parts = [part.strip() for part in text.replace("\n", ",").split(",")]
+    explicit = any("=" in part for part in parts if part)
+    if explicit:
+        for part in parts:
+            if not part:
+                continue
+            if "=" not in part:
+                errors.append(f"Expected N=score, got: {part}")
+                continue
+            left, right = [p.strip() for p in part.split("=", 1)]
+            try:
+                index = int(left) - 1
+            except ValueError:
+                errors.append(f"Invalid criterion number: {left}")
+                continue
+            _apply_score_at_index(updated, index, right, errors)
+        return updated, errors
+
+    for index, score_text in enumerate(parts):
+        if not score_text:
+            continue
+        _apply_score_at_index(updated, index, score_text, errors)
+    return updated, errors
+
+
+def batch_edit_breakdown(console: Console, breakdown: list) -> list:
+    """Edit multiple scores using a keyboard-driven table when available."""
+    if sys.stdin.isatty():
+        return navigate_edit_breakdown(console, breakdown)
+    return prompt_batch_scores(console, breakdown)
+
+
+def prompt_batch_scores(console: Console, breakdown: list) -> list:
+    """Prompt once for multiple score edits and return an updated breakdown."""
+    console.print()
+    console.print(Panel(
+        "[bold]Batch Edit Criterion Scores[/bold]\n"
+        "Formats: [cyan]1=8,2=6,5=0[/cyan] or [cyan]8,6,,10[/cyan]\n"
+        "Blank entries keep current scores.",
+        border_style="magenta",
+    ))
+    _print_breakdown_score_table(console, breakdown)
+    current_total, current_max = calculate_breakdown_totals(breakdown)
+    console.print(f"\n[bold]Current Total:[/bold] {current_total} / {current_max}")
+    raw = prompt_text("[bold magenta]Batch scores[/bold magenta]", default="", console=console)
+    if not raw.strip():
+        console.print("[dim]No batch edits applied.[/dim]")
+        return breakdown
+
+    updated, errors = apply_batch_scores(breakdown, raw)
+    if errors:
+        for error in errors:
+            console.print(f"[red]{error}[/red]")
+        console.print("[yellow]Batch edit cancelled; no scores changed.[/yellow]")
+        return breakdown
+    return updated
+
+
+def navigate_edit_breakdown(console: Console, breakdown: list) -> list:
+    """Use arrow keys to choose a criterion and edit scores in-place."""
+    updated = [dict(item) for item in breakdown]
+    selected = 0
+    message = ""
+
+    with Live(_navigate_editor_renderable(updated, selected, message), console=console, refresh_per_second=12, transient=True) as live:
+        while True:
+            live.update(_navigate_editor_renderable(updated, selected, message))
+            key = _read_key()
+            message = ""
+            if key in ("q", "Q"):
+                return updated
+            if key in ("\x1b", "\x03"):
+                console.print("[yellow]Batch edit cancelled; no scores changed.[/yellow]")
+                return breakdown
+            if key in ("up", "k"):
+                selected = max(0, selected - 1)
+                continue
+            if key in ("down", "j"):
+                selected = min(len(updated) - 1, selected + 1)
+                continue
+            if key in ("\r", "\n", "e"):
+                live.stop()
+                item = updated[selected]
+                max_val = float(item.get("points_max", 0))
+                current = str(item.get("points_awarded", 0))
+                console.print(f"\n[bold]Editing #{selected + 1}:[/bold] {item.get('criterion', '')}")
+                new_score = Prompt.ask(f"New score (0-{max_val})", default=current)
+                errors: list[str] = []
+                _apply_score_at_index(updated, selected, new_score, errors)
+                message = f"[red]{errors[0]}[/red]" if errors else f"[green]Updated #{selected + 1} to {updated[selected]['points_awarded']}[/green]"
+                live.start(refresh=True)
+
+
+def _navigate_editor_renderable(breakdown: list, selected: int, message: str = "") -> Group:
+    header = Panel(
+        "[bold]Batch Edit Criterion Scores[/bold]\n"
+        "Use [cyan]↑/↓[/cyan] or [cyan]k/j[/cyan] to move, [cyan]Enter[/cyan] to edit, "
+        "[cyan]q[/cyan] to save and return, [cyan]Esc[/cyan] to cancel.",
+        border_style="magenta",
+    )
+    table = Table()
+    table.add_column("", width=2)
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Criterion", style="cyan")
+    table.add_column("Awarded", justify="right")
+    table.add_column("Max", justify="right")
+    for i, item in enumerate(breakdown):
+        awarded = float(item.get("points_awarded", 0))
+        max_p = float(item.get("points_max", 0))
+        pointer = ">" if i == selected else ""
+        style = "bold reverse" if i == selected else ("red" if awarded < max_p else "green")
+        table.add_row(pointer, str(i + 1), str(item.get("criterion", "")), Text(f"{awarded}", style=style), f"{max_p}")
+    total, max_total = calculate_breakdown_totals(breakdown)
+    footer = Text.from_markup(f"[bold]Current Total:[/bold] {total} / {max_total}")
+    if message:
+        return Group(header, table, footer, Text.from_markup(message))
+    return Group(header, table, footer)
+
+
+def _read_key() -> str:
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            rest = sys.stdin.read(2)
+            if rest == "[A":
+                return "up"
+            if rest == "[B":
+                return "down"
+            return "\x1b"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _apply_score_at_index(breakdown: list, index: int, score_text: str, errors: list[str]) -> None:
+    if index < 0 or index >= len(breakdown):
+        errors.append(f"Criterion number out of range: {index + 1}")
+        return
+    try:
+        score_val = float(score_text)
+    except ValueError:
+        errors.append(f"Invalid score for criterion {index + 1}: {score_text}")
+        return
+    max_val = float(breakdown[index].get("points_max", 0))
+    if not 0 <= score_val <= max_val:
+        errors.append(f"Score for criterion {index + 1} must be between 0 and {max_val}")
+        return
+    breakdown[index]["points_awarded"] = score_val
+
+
+def _print_breakdown_score_table(console: Console, breakdown: list) -> None:
+    table = Table()
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Criterion", style="cyan")
+    table.add_column("Awarded", justify="right", style="green")
+    table.add_column("Max", justify="right")
+    for i, item in enumerate(breakdown, start=1):
+        awarded = float(item.get("points_awarded", 0))
+        max_p = float(item.get("points_max", 0))
+        style = "red" if awarded < max_p else "green"
+        table.add_row(str(i), str(item.get("criterion", "")), Text(f"{awarded}", style=style), f"{max_p}")
+    console.print(table)
+
+
 def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, float]:
     """Interactive editor for breakdown. Returns (new_breakdown, new_total, new_max)."""
     while True:
@@ -317,27 +532,10 @@ def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, floa
                            "Enter the number of the criterion to edit, or 'd' when done",
                            border_style="magenta"))
 
-        # Show current breakdown with numbers
-        bd_table = Table()
-        bd_table.add_column("#", style="dim", justify="right")
-        bd_table.add_column("Criterion", style="cyan")
-        bd_table.add_column("Awarded", justify="right", style="green")
-        bd_table.add_column("Max", justify="right")
-        for i, item in enumerate(breakdown, start=1):
-            awarded = float(item.get("points_awarded", 0))
-            max_p = float(item.get("points_max", 0))
-            style = "red" if awarded < max_p else "green"
-            bd_table.add_row(
-                str(i),
-                str(item.get("criterion", "")),
-                Text(f"{awarded}", style=style),
-                f"{max_p}"
-            )
-        console.print(bd_table)
+        _print_breakdown_score_table(console, breakdown)
 
         # Calculate and show current total
-        current_total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
-        current_max = sum(float(b.get("points_max", 0)) for b in breakdown)
+        current_total, current_max = calculate_breakdown_totals(breakdown)
         console.print(f"\n[bold]Current Total:[/bold] {current_total} / {current_max}")
         console.print()
 
@@ -346,8 +544,7 @@ def edit_breakdown(console: Console, breakdown: list) -> tuple[list, float, floa
                            default="d")
 
         if choice.lower() in ("d", "done"):
-            new_total = sum(float(b.get("points_awarded", 0)) for b in breakdown)
-            new_max = sum(float(b.get("points_max", 0)) for b in breakdown)
+            new_total, new_max = calculate_breakdown_totals(breakdown)
             return breakdown, new_total, new_max
 
         # Edit selected criterion

@@ -19,7 +19,7 @@ def test_lookup_bb_user_ids_uses_v1_and_maps_student_ids(monkeypatch):
 
     monkeypatch.setattr(BlackboardCrawler, "_paginate", fake_paginate)
 
-    mapping = _lookup_bb_user_ids(httpx.Client(), "_98532_1")
+    mapping = _lookup_bb_user_ids(httpx.Client(trust_env=False), "_98532_1")
 
     assert captured["path"] == "/learn/api/public/v1/courses/_98532_1/users"
     assert captured["params"] == {"role": "Student", "fields": "userId,user.studentId,user.userName"}
@@ -43,7 +43,7 @@ def test_fetch_attempt_ids_uses_v1_and_keeps_latest_attempt_per_user(monkeypatch
 
     monkeypatch.setattr(BlackboardCrawler, "_paginate", fake_paginate)
 
-    mapping = _fetch_attempt_ids(httpx.Client(), "_98532_1", "_424504_1")
+    mapping = _fetch_attempt_ids(httpx.Client(trust_env=False), "_98532_1", "_424504_1")
 
     assert captured["path"] == "/learn/api/public/v1/courses/_98532_1/gradebook/columns/_424504_1/attempts"
     assert captured["params"] is None

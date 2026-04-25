@@ -27,6 +27,7 @@ from review.tui_components import (
     auto_approve_students,
     ReviewSession,
     handle_approve,
+    handle_batch_edit,
     handle_edit,
     handle_notes,
     handle_override,
@@ -189,12 +190,12 @@ def run_review_tui(
                 console.print(f"[bold blue]Rubric:[/bold blue] {rubric}")
             console.print()
 
-            choices = ["a", "approve", "s", "skip", "e", "edit", "n", "notes", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
+            choices = ["a", "approve", "s", "skip", "e", "edit", "ne", "number-edit", "n", "notes", "o", "open", "r", "rubric", "ov", "override", "q", "quit"]
             if session.current_idx > 0:
                 choices.extend(["b", "back"])
 
             action = Prompt.ask(
-                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (n)otes (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
+                "[bold cyan]Action[/bold cyan] [dim](a)pprove (s)kip (e)dit (ne)number-edit (n)otes (o)pen (r)ubric (ov)erride (b)ack (q)uit[/dim]",
                 choices=choices,
                 default="skip",
                 show_choices=False,
@@ -214,6 +215,8 @@ def run_review_tui(
             elif action in ("n", "notes"):
                 handle_notes(session, row_idx, row_data, console)
             elif action in ("e", "edit"):
+                breakdown = handle_batch_edit(session, row_idx, row_data, breakdown, console)
+            elif action in ("ne", "number-edit"):
                 breakdown = handle_edit(session, row_idx, row_data, breakdown, console)
             elif action in ("o", "open") and sub_file:
                 open_file(sub_file, console)

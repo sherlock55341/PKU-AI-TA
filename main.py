@@ -2,10 +2,11 @@
 PKU AI Teaching Assistant CLI
 
 Commands:
-  ta grade   --course <id> --column <id> --rubric <file> [--whitelist a,b,c] [--out scores.xlsx] [--verbose] [--resume] [--lang en|zh]
+  ta grade   [--course <id>] [--column <id>] --rubric <file> [--backend api-key|codex-cli] [--whitelist a,b,c] [--out scores.xlsx] [--verbose] [--resume]
+  ta tui
   ta list-assignments [--course <id>]
   ta review  [--scores scores.xlsx] [--submissions submissions/] [--needs-review] [--all]
-  ta submit  --course <id> --column <id> --scores <reviewed.xlsx> [--dry-run]
+  ta submit  [--course <id>] [--column <id>] --scores <reviewed.xlsx> [--dry-run]
 """
 from __future__ import annotations
 
@@ -25,8 +26,8 @@ console = Console()
 
 @app.command()
 def grade(
-    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
-    column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID")] = "",
+    course: Annotated[str, typer.Option(help="Optional Blackboard course ID shortcut; omit to choose from TUI")] = "",
+    column: Annotated[str, typer.Option(help="Optional assignment ID shortcut; omit to choose from TUI")] = "",
     rubric: Annotated[Path, typer.Option(help="Path to rubric file (any format the LLM supports)")] = Path("rubric.md"),
     whitelist: Annotated[str, typer.Option(help="Comma-separated student IDs to include; empty = all")] = "",
     out: Annotated[Path, typer.Option(help="Output Excel path")] = Path("scores.xlsx"),
@@ -35,6 +36,7 @@ def grade(
     resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume from previous partial run (if any)")] = False,
     regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Keep approved students, only regrade those not approved")] = False,
     prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM (default: prompts/system_en.md)")] = Path("prompts/system_en.md"),
+    backend: Annotated[str, typer.Option(help="Scoring backend: api-key or codex-cli")] = "api-key",
 ) -> None:
     """Crawl submissions, score with LLM, export review spreadsheet.
 
@@ -51,8 +53,16 @@ def grade(
     from crawler.blackboard import BlackboardCrawler
     from crawler.pku_homework import PKUHomeworkCrawler
     from review.spreadsheet import export
-    from scorer.llm import score_submission
     from models import ScoringResult
+
+    backend = _normalize_backend(backend)
+    if backend == "codex-cli":
+        from scorer.codex_cli import score_submission_with_codex_cli as score_submission
+    else:
+        from scorer.llm import score_submission
+        if not settings.openai_api_key:
+            console.print("[red]Error:[/red] API key backend requires OPENAI_API_KEY or TUI-provided API key.")
+            raise typer.Exit(1)
 
     # Checkpoint save/load using Excel format
     checkpoint_path = out
@@ -106,11 +116,7 @@ def grade(
         all_results = []
         processed_ids = set()
 
-    # Resolve config — CLI args override .env
     course_id = course or settings.course_id
-    if not course_id:
-        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
-        raise typer.Exit(1)
 
     # Determine whitelist:
     # - If --regrade-unapproved: only regrade unapproved students
@@ -131,7 +137,16 @@ def grade(
     rubric_text = rubric.read_text(encoding="utf-8")
 
     console.print("[bold]Step 1/3:[/bold] Authenticating with PKU IAAA…")
-    client = get_session()
+    client = _get_session_interactive(get_session, settings)
+
+    if not course_id or not column:
+        selected_course, selected_assignment = _select_missing_course_assignment(
+            client=client,
+            course_id=course_id,
+            column=column,
+        )
+        course_id = selected_course
+        column = selected_assignment
 
     pku_crawler = PKUHomeworkCrawler(client, course_id, whitelist_ids)
     bb_crawler = BlackboardCrawler(client, course_id, whitelist_ids)
@@ -221,7 +236,7 @@ def grade(
                 console.print(f"  Saved files → [cyan]{save_dir / col_title}[/cyan]")
 
             total_submissions = len(submissions)
-            console.print(f"  Scoring {total_submissions} submission(s) with LLM (threads={settings.ta_threads}, prompt={prompt.name})…")
+            console.print(f"  Scoring {total_submissions} submission(s) with {backend} (threads={settings.ta_threads}, prompt={prompt.name})…")
             console.print(f"  [dim]Press Ctrl-C to interrupt — progress will be saved[/dim]")
 
             # Use transient=False for verbose mode so results stay on screen
@@ -309,20 +324,22 @@ def grade(
 
 @app.command()
 def list_assignments(
-    course: Annotated[str, typer.Option(help="Blackboard course ID, e.g. _12345_1")] = "",
+    course: Annotated[str, typer.Option(help="Optional Blackboard course ID shortcut; omit to choose from TUI")] = "",
 ) -> None:
     """List all assignments in the course with their gradeBookPK values."""
     from auth.iaaa import get_session
     from config import settings
     from crawler.pku_homework import PKUHomeworkCrawler
+    from review.selection_tui import select_course
 
     course_id = course or settings.course_id
-    if not course_id:
-        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env)")
-        raise typer.Exit(1)
 
     console.print("[bold]Authenticating with PKU IAAA…[/bold]")
-    client = get_session()
+    client = _get_session_interactive(get_session, settings)
+
+    if not course_id:
+        selected_course = select_course(console=console, client=client, default_course_id=settings.course_id)
+        course_id = selected_course.id
 
     crawler = PKUHomeworkCrawler(client, course_id, whitelist=set())
     console.print("[bold]Fetching assignment list…[/bold]")
@@ -342,10 +359,142 @@ def list_assignments(
         console.print(f"   column id:   {col_id}")
 
 
+@app.command("debug-courses")
+def debug_courses(
+    output: Annotated[Path, typer.Option(help="Sanitized debug HTML output path")] = Path("debug_courses.html"),
+) -> None:
+    """Debug Blackboard course discovery after PKU login."""
+    from auth.iaaa import get_session
+    from config import settings
+    from crawler.blackboard import debug_course_discovery
+    from review.selection_tui import prompt_login_wizard_config
+
+    try:
+        login = prompt_login_wizard_config(console=console, defaults=settings)
+        console.print("[bold]Authenticating with PKU IAAA...[/bold]")
+        client = get_session(login.pku_username, login.pku_password)
+        console.print("[bold]Fetching candidate course pages...[/bold]")
+        diagnostics = debug_course_discovery(client, output)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        raise typer.Exit(0)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {_summarize_error(e)}")
+        raise typer.Exit(1)
+
+    found = 0
+    for item in diagnostics:
+        status = item["status"] if item["status"] is not None else "ERR"
+        title = item["title"] or "-"
+        console.print(f"\n[bold cyan]{item['path']}[/bold cyan]")
+        console.print(f"  status: {status}")
+        console.print(f"  title:  {title}")
+        if item["error"]:
+            console.print(f"  [yellow]error:[/yellow] {item['error']}")
+        links = item["course_links"]
+        if links:
+            found += len(links)
+            for link in links[:20]:
+                console.print(f"  [green]{link['id']}[/green]  {link['name']}")
+            if len(links) > 20:
+                console.print(f"  [dim]... {len(links) - 20} more[/dim]")
+        else:
+            console.print("  [dim]no course_id links found[/dim]")
+
+    console.print(f"\n[bold]Found {found} course link(s).[/bold]")
+    console.print(f"Sanitized debug HTML saved to [cyan]{output}[/cyan].")
+    console.print("[yellow]Before sharing the file, skim it once for personal information.[/yellow]")
+
+
+@app.command("tui")
+def interactive_tui(
+    rubric: Annotated[Path, typer.Option(help="Path to rubric file for grading/review")] = Path("rubric.md"),
+    whitelist: Annotated[str, typer.Option(help="Comma-separated student IDs to include when grading; empty = all")] = "",
+    out: Annotated[Path, typer.Option(help="Output Excel path when grading")] = Path("scores.xlsx"),
+    save_dir: Annotated[Optional[Path], typer.Option(help="Save submission files here when grading")] = Path("submissions"),
+    prompt: Annotated[Path, typer.Option(help="System prompt file for the LLM")] = Path("prompts/system_en.md"),
+    scores: Annotated[Path, typer.Option(help="Reviewed Excel spreadsheet for review/submit")] = Path("scores.xlsx"),
+    submissions: Annotated[Path, typer.Option(help="Directory with submission files for review")] = Path("submissions"),
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show intermediate scores when grading")] = False,
+    resume: Annotated[bool, typer.Option("--resume", "-r", help="Resume previous grading output")] = False,
+    regrade_unapproved: Annotated[bool, typer.Option("--regrade-unapproved", help="Only regrade unapproved records")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview submit action without posting")] = False,
+) -> None:
+    """Run a complete interactive batch grading workflow."""
+    from auth.iaaa import get_session
+    from config import settings
+    from rich.prompt import Confirm
+    from review.selection_tui import (
+        prompt_grading_wizard_config,
+        prompt_login_wizard_config,
+        select_course_and_assignment,
+    )
+    from scorer.llm import configure_api_backend
+
+    try:
+        login = prompt_login_wizard_config(console=console, defaults=settings)
+        settings.pku_username = login.pku_username
+        settings.pku_password = login.pku_password
+
+        console.print("[bold]Authenticating with PKU IAAA...[/bold]")
+        client = get_session(login.pku_username, login.pku_password)
+        course, assignment = select_course_and_assignment(
+            console=console,
+            client=client,
+            default_course_id=settings.course_id,
+        )
+        console.print(
+            f"[green]Selected:[/green] {course.name} ({course.id}) / "
+            f"{assignment.name} ({assignment.grade_book_pk or assignment.id})"
+        )
+        wizard = prompt_grading_wizard_config(
+            console=console,
+            defaults=settings,
+            backend=login.backend,
+            rubric_default=rubric,
+            prompt_default=prompt,
+            out_default=out,
+            save_dir_default=save_dir,
+        )
+        settings.ta_threads = wizard.ta_threads
+        if wizard.backend == "api-key":
+            configure_api_backend(
+                base_url=wizard.openai_base_url,
+                api_key=wizard.openai_api_key,
+                model=wizard.model,
+                enable_thinking=wizard.enable_thinking,
+            )
+        if not Confirm.ask("[bold cyan]Start grading this assignment now?[/bold cyan]", default=True):
+            console.print("[yellow]Cancelled before grading.[/yellow]")
+            raise typer.Exit(0)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        raise typer.Exit(0)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {_summarize_error(e)}")
+        raise typer.Exit(1)
+
+    selected_column = assignment.grade_book_pk or assignment.id
+
+    grade(
+        course=course.id,
+        column=selected_column,
+        rubric=wizard.rubric,
+        whitelist=wizard.whitelist or whitelist,
+        out=wizard.out,
+        save_dir=wizard.save_dir,
+        verbose=wizard.verbose or verbose,
+        resume=resume,
+        regrade_unapproved=regrade_unapproved,
+        prompt=wizard.prompt,
+        backend=wizard.backend,
+    )
+
+
 @app.command()
 def submit(
-    course: Annotated[str, typer.Option(help="Blackboard course ID")] = "",
-    column: Annotated[str, typer.Option(help="Gradebook column (assignment) ID")] = "",
+    course: Annotated[str, typer.Option(help="Optional Blackboard course ID shortcut; omit to choose from TUI")] = "",
+    column: Annotated[str, typer.Option(help="Optional assignment ID shortcut; omit to infer or choose from TUI")] = "",
     scores: Annotated[Path, typer.Option(help="Reviewed Excel spreadsheet")] = Path("scores.xlsx"),
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Print what would be submitted without posting")] = False,
 ) -> None:
@@ -356,13 +505,13 @@ def submit(
     from submitter.blackboard import submit_scores
 
     course_id = course or settings.course_id
-    if not course_id:
-        console.print("[red]Error:[/red] --course is required (or set COURSE_ID in .env).")
-        raise typer.Exit(1)
 
     if not scores.exists():
         console.print(f"[red]Error:[/red] Scores file not found: {scores}")
         raise typer.Exit(1)
+
+    console.print("[bold]Authenticating with PKU IAAA…[/bold]")
+    client = _get_session_interactive(get_session, settings)
 
     records = load_reviewed(scores)
     assignment_ids = sorted({r.result.assignment_id for r in records if r.result.assignment_id})
@@ -372,8 +521,20 @@ def submit(
             selected_column = assignment_ids[0]
             console.print(f"[dim]Using assignment ID from spreadsheet:[/dim] {selected_column}")
         else:
-            console.print("[red]Error:[/red] --column is required when the spreadsheet contains multiple assignments.")
-            raise typer.Exit(1)
+            selected_course, selected_column = _select_missing_course_assignment(
+                client=client,
+                course_id=course_id,
+                column="",
+            )
+            course_id = selected_course
+
+    if not course_id:
+        selected_course, selected_column = _select_missing_course_assignment(
+            client=client,
+            course_id="",
+            column=selected_column,
+        )
+        course_id = selected_course
 
     _, selected_col_id = _normalize_column_identifiers(selected_column)
     filtered_records = [r for r in records if _column_matches_assignment(selected_col_id, r.result.assignment_id)]
@@ -410,9 +571,6 @@ def submit(
         )
         console.print("[yellow]Regenerate the scores file or remove duplicate rows before submitting.[/yellow]")
         raise typer.Exit(1)
-
-    console.print("[bold]Authenticating with PKU IAAA…[/bold]")
-    client = get_session()
 
     submit_scores(client, course_id, selected_col_id, filtered_records, dry_run=dry_run)
 
@@ -460,6 +618,56 @@ def review(
         raise typer.Exit(1)
 
 
+def _get_session_interactive(get_session_func, settings):
+    """Authenticate, prompting for PKU credentials only when configuration is missing."""
+    if settings.pku_username and settings.pku_password:
+        return get_session_func()
+
+    from review.selection_tui import prompt_pku_credentials
+
+    credentials = prompt_pku_credentials(console=console, defaults=settings)
+    settings.pku_username = credentials.pku_username
+    settings.pku_password = credentials.pku_password
+    return get_session_func(credentials.pku_username, credentials.pku_password)
+
+
+def _select_missing_course_assignment(
+    *,
+    client,
+    course_id: str,
+    column: str,
+) -> tuple[str, str]:
+    """Select missing course or assignment IDs through the TUI selector."""
+    from config import settings
+    from review.selection_tui import (
+        fetch_assignment_options,
+        select_assignment,
+        select_course,
+        select_course_and_assignment,
+    )
+
+    if not course_id and not column:
+        course, assignment = select_course_and_assignment(
+            console=console,
+            client=client,
+            default_course_id=settings.course_id,
+        )
+        return course.id, assignment.grade_book_pk or assignment.id
+
+    if not course_id:
+        course = select_course(console=console, client=client, default_course_id=settings.course_id)
+        return course.id, column
+
+    if not column:
+        assignments = fetch_assignment_options(client, course_id, console)
+        if not assignments:
+            raise RuntimeError(f"No assignments found for course {course_id}.")
+        assignment = select_assignment(console, assignments)
+        return course_id, assignment.grade_book_pk or assignment.id
+
+    return course_id, column
+
+
 def _save_submissions(submissions: list, save_dir: Path, assignment_title: str) -> None:
     """Save each student's attachment file to save_dir/assignment_title/ for human review."""
     import re
@@ -492,6 +700,20 @@ def _normalize_column_identifiers(column: str) -> tuple[str, str]:
 def _column_matches_assignment(column_id: str, assignment_id: str) -> bool:
     _, normalized_assignment = _normalize_column_identifiers(assignment_id)
     return normalized_assignment == column_id
+
+
+def _normalize_backend(backend: str) -> str:
+    value = backend.strip().lower().replace("_", "-")
+    aliases = {
+        "api": "api-key",
+        "api-key": "api-key",
+        "codex": "codex-cli",
+        "codex-cli": "codex-cli",
+    }
+    if value not in aliases:
+        console.print("[red]Error:[/red] --backend must be api-key or codex-cli")
+        raise typer.Exit(1)
+    return aliases[value]
 
 
 def _summarize_error(exc: Exception, limit: int = 240) -> str:

@@ -10,7 +10,7 @@ Automatically grades student homework submissions from [course.pku.edu.cn](https
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) package manager
-- An [OpenRouter](https://openrouter.ai) API key (or any OpenAI-compatible endpoint)
+- Either Codex CLI signed in, or an [OpenRouter](https://openrouter.ai) API key (or any OpenAI-compatible endpoint)
 - PKU IAAA credentials (student/staff ID + password)
 
 ---
@@ -74,6 +74,26 @@ Create `rubric.md` describing the scoring criteria. Example:
 
 ## Usage
 
+### Interactive batch grading
+
+The easiest path is the full TUI wizard. It does not require pre-populating
+`.env`; it asks for the needed values at runtime.
+
+```bash
+uv run python main.py tui
+```
+
+The wizard supports two scoring backends:
+
+| Backend | Use when |
+|---|---|
+| `codex-cli` | You have Codex CLI installed and signed in. No manual API key is required. |
+| `api-key` | You want to use OpenAI, OpenRouter, or another OpenAI-compatible API key. |
+
+`codex-cli` is the default interactive backend. The tool invokes `codex exec`
+as a child process and inherits the same terminal environment, including
+VPN/proxy variables such as `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+
 ### Step 1 — Grade
 
 Crawl submissions, score with LLM, and export a review spreadsheet:
@@ -84,6 +104,9 @@ uv run python main.py list-assignments --course _98024_1
 
 # Grade all students in the course
 uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
+
+# Grade with local Codex CLI login instead of an API key
+uv run python main.py grade --backend codex-cli --course _98024_1 --column 423829 --rubric rubric.md
 
 # Grade only students in your whitelist file
 uv run python main.py grade \
@@ -110,6 +133,7 @@ uv run python main.py grade --course _98024_1 --column 423829 --rubric rubric.md
 | `--course` | Blackboard course ID (or set `COURSE_ID` in `.env`) |
 | `--column` | Assignment `gradeBookPK` — the numeric ID in the `getStudentWork.do` URL |
 | `--rubric` | Path to your rubric Markdown file |
+| `--backend` | Scoring backend: `api-key` (default) or `codex-cli` |
 | `--whitelist` | Comma-separated student IDs to grade; omit to grade everyone |
 | `--out` | Output Excel file (default: `scores.xlsx`) |
 | `--prompt` | System prompt file for the LLM (default: `prompts/system_en.md`) |
